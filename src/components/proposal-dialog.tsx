@@ -10,7 +10,18 @@ import {
 } from "@/components/ui/dialog";
 
 export type ArchitectureProposal = {
+  goal: string;
   summary: string;
+  profileLabel: string;
+  assumptions: string[];
+  decisions: Array<{
+    decision: string;
+    rationale: string;
+    related_node_refs: string[];
+  }>;
+  preflightStatus: "healthy" | "warning" | "critical";
+  preflightScore: number;
+  preflightWarnings: number;
   changes: string[];
   beforeCost: number;
   afterCost: number;
@@ -45,6 +56,32 @@ export function ProposalDialog({
         <DialogDescription className="mt-2 text-sm leading-6 text-zinc-400">
           {proposal?.summary}
         </DialogDescription>
+
+        <div className="proposal-contract-summary">
+          <span>{proposal?.profileLabel}</span>
+          <strong>{proposal?.preflightScore}/100 preflight</strong>
+          <small>{proposal?.preflightWarnings} non-blocking warning(s)</small>
+        </div>
+
+        <div className="proposal-explanation">
+          <div>
+            <span>Goal</span>
+            <p>{proposal?.goal}</p>
+          </div>
+          {proposal?.decisions.map((item) => (
+            <div key={`${item.decision}:${item.rationale}`}>
+              <span>Decision</span>
+              <strong>{item.decision}</strong>
+              <p>{item.rationale}</p>
+            </div>
+          ))}
+          {proposal && proposal.assumptions.length > 0 ? (
+            <div>
+              <span>Assumptions</span>
+              <p>{proposal.assumptions.join(" · ")}</p>
+            </div>
+          ) : null}
+        </div>
 
         <div className="my-5 flex items-center justify-between rounded-xl border border-white/8 bg-black/20 p-4">
           <div>

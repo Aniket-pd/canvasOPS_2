@@ -35,6 +35,7 @@ import {
   ChevronDown,
   CircleDollarSign,
   Cloud,
+  ClipboardList,
   Cog,
   Copy,
   Database,
@@ -69,6 +70,7 @@ import {
 } from "react";
 import { z } from "zod";
 import { InfrastructureNodeCard } from "@/components/infrastructure-node";
+import { ArchitectureBriefDialog } from "@/components/architecture-brief-dialog";
 import {
   JudgeModePanel,
   type JudgeStep,
@@ -83,6 +85,14 @@ import {
   ProposalDialog,
 } from "@/components/proposal-dialog";
 import { Button } from "@/components/ui/button";
+import {
+  architectureBriefFingerprint,
+  architectureProfileIds,
+  architectureProfiles,
+  defaultArchitectureBrief,
+  normalizeArchitectureBrief,
+  type ArchitectureBrief,
+} from "@/lib/architecture-brief";
 import {
   architectureHash,
   autoLayoutArchitecture,
@@ -108,6 +118,7 @@ import { simulateX402Settlement } from "@/lib/x402-mock";
 
 const nodeTypes = { infrastructure: InfrastructureNodeCard };
 const STORAGE_KEY = "canvasops.graph.v2";
+const BRIEF_STORAGE_KEY = "canvasops.architecture-brief.v1";
 
 const configSchema = z
   .object({
@@ -130,6 +141,7 @@ const configSchema = z
 
 const analyzeArchitectureSchema = z.object({}).strict();
 const getComponentCatalogSchema = z.object({}).strict();
+const getArchitectureContextSchema = z.object({}).strict();
 const getSelectionContextSchema = z.object({}).strict();
 const addInfrastructureNodeSchema = z
   .object({
@@ -315,6 +327,26 @@ const planOperationSchema = z.discriminatedUnion("action", [
 const proposeArchitecturePlanSchema = z
   .object({
     summary: z.string().min(8).max(240),
+    goal: z.string().min(8).max(300),
+    profile: z.enum(architectureProfileIds),
+    brief_fingerprint: z.string().min(8).max(64),
+    assumptions: z.array(z.string().min(3).max(240)).max(12),
+    unresolved_questions: z.array(z.string().min(3).max(240)).max(8),
+    decisions: z
+      .array(
+        z
+          .object({
+            decision: z.string().min(3).max(160),
+            rationale: z.string().min(8).max(500),
+            related_node_refs: z
+              .array(z.string().min(1).max(128))
+              .max(12)
+              .default([]),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(12),
     max_monthly_cost_usdc: z.number().positive().max(100_000).optional(),
     operations: z.array(planOperationSchema).min(1).max(24),
   })
@@ -454,6 +486,7 @@ const browserPrompts = judgeSteps.map((step) => step.prompt);
 
 const registeredToolNames = [
   "analyze_current_architecture",
+  "get_architecture_context",
   "get_component_catalog",
   "get_selection_context",
   "validate_architecture",
@@ -688,6 +721,9 @@ function wait(milliseconds: number) {
 }
 
 export function CanvasOpsApp() {
+  const [architectureBrief, setArchitectureBrief] =
+    useState<ArchitectureBrief>(defaultArchitectureBrief);
+  const [briefOpen, setBriefOpen] = useState(false);
   const [nodes, setNodes, onNodesChange] =
     useNodesState<InfrastructureNode>(initialNodes);
   const [edges, setEdges] = useEdgesState<Edge>(initialEdges);
@@ -735,6 +771,11 @@ export function CanvasOpsApp() {
   const visualChangeTimerRef = useRef<number | null>(null);
   const paymentResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const proposalResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  const briefFingerprint = useMemo(
+    () => architectureBriefFingerprint(architectureBrief),
+    [architectureBrief],
+  );
+  const activeArchitectureProfile = architectureProfiles[architectureBrief.profile];
 
   const applyGraph = useCallback(
     (nextNodes: InfrastructureNode[], nextEdges: Edge[]) => {
@@ -879,6 +920,26 @@ export function CanvasOpsApp() {
   }, [selectedEdgeId, selectedNodeIds]);
 
   useEffect(() => {
+    let active = true;
+    try {
+      const savedBrief = window.localStorage.getItem(BRIEF_STORAGE_KEY);
+      if (savedBrief) {
+        const normalized = normalizeArchitectureBrief(
+          JSON.parse(savedBrief) as Partial<ArchitectureBrief>,
+        );
+        queueMicrotask(() => {
+          if (active) setArchitectureBrief(normalized);
+        });
+      }
+    } catch {
+      window.localStorage.removeItem(BRIEF_STORAGE_KEY);
+    }
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     try {
       const saved = window.localStorage.getItem(STORAGE_KEY);
       if (saved) {
@@ -908,6 +969,13 @@ export function CanvasOpsApp() {
     }
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges }));
   }, [edges, nodes]);
+
+  const saveArchitectureBrief = useCallback((draft: ArchitectureBrief) => {
+    const normalized = normalizeArchitectureBrief(draft);
+    setArchitectureBrief(normalized);
+    window.localStorage.setItem(BRIEF_STORAGE_KEY, JSON.stringify(normalized));
+    setBriefOpen(false);
+  }, []);
 
   const logToolEvent = useCallback(
     (
@@ -1290,6 +1358,8 @@ export function CanvasOpsApp() {
       edge_count: edgesRef.current.length,
       estimated_monthly_cost_usdc: validation.estimatedMonthlyCostUsdc,
       architecture_hash: architectureHash(nodesRef.current, edgesRef.current),
+      architecture_brief_fingerprint: briefFingerprint,
+      architecture_profile: architectureBrief.profile,
       resilience_score: validation.resilienceScore,
       disconnected_node_ids: validation.disconnectedNodeIds,
       nodes: nodesRef.current.map((node) => ({
@@ -1316,7 +1386,7 @@ export function CanvasOpsApp() {
         edge_id: selectedEdgeIdRef.current,
       },
     };
-  }, []);
+  }, [architectureBrief.profile, briefFingerprint]);
 
   const getSelectionContext = useCallback(() => {
     const selectedIds = new Set(selectedNodeIdsRef.current);
@@ -1970,17 +2040,102 @@ export function CanvasOpsApp() {
 
   const proposeArchitecturePlan = useCallback(
     async (parsed: PlanInput) => {
+      if (parsed.brief_fingerprint !== briefFingerprint) {
+        logToolEvent(
+          "propose_architecture_plan",
+          "Rejected a stale plan because the architecture brief changed.",
+          parsed,
+          "cancelled",
+        );
+        return {
+          success: false as const,
+          status: "stale_brief" as const,
+          expected_brief_fingerprint: briefFingerprint,
+        };
+      }
+      if (parsed.profile !== architectureBrief.profile) {
+        logToolEvent(
+          "propose_architecture_plan",
+          `Rejected a plan using ${parsed.profile}; the active expert is ${architectureBrief.profile}.`,
+          parsed,
+          "cancelled",
+        );
+        return {
+          success: false as const,
+          status: "profile_mismatch" as const,
+          expected_profile: architectureBrief.profile,
+        };
+      }
+      if (parsed.unresolved_questions.length > 0) {
+        logToolEvent(
+          "propose_architecture_plan",
+          `Plan needs answers to ${parsed.unresolved_questions.length} unresolved question(s).`,
+          parsed,
+          "cancelled",
+        );
+        return {
+          success: false as const,
+          status: "needs_clarification" as const,
+          unresolved_questions: parsed.unresolved_questions,
+        };
+      }
       const preview = previewPlan(parsed);
       const beforeCost = calculateMonthlyTotal(nodesRef.current);
       const afterCost = calculateMonthlyTotal(preview.nextNodes);
       const beforeHash = architectureHash(nodesRef.current, edgesRef.current);
       const finalHash = architectureHash(preview.nextNodes, preview.nextEdges);
+      const enforcedBudget = Math.min(
+        architectureBrief.maxMonthlyCost,
+        parsed.max_monthly_cost_usdc ?? Number.POSITIVE_INFINITY,
+      );
+      const preflight = validateArchitecture(
+        preview.nextNodes,
+        preview.nextEdges,
+        {
+          maxMonthlyCost: enforcedBudget,
+          requiredRegions: architectureBrief.requiredRegions,
+          minimumReplicas: architectureBrief.minimumReplicas,
+        },
+      );
+      const blockingFindings = preflight.findings.filter(
+        (finding) => finding.severity === "critical",
+      );
+      if (blockingFindings.length > 0) {
+        logToolEvent(
+          "propose_architecture_plan",
+          `Preflight rejected the plan with ${blockingFindings.length} blocking finding(s).`,
+          parsed,
+          "cancelled",
+        );
+        return {
+          success: false as const,
+          status: "needs_revision" as const,
+          resilience_score: preflight.resilienceScore,
+          findings: blockingFindings.map((finding) => ({
+            id: finding.id,
+            title: finding.title,
+            detail: finding.detail,
+            node_ids: finding.nodeIds,
+          })),
+          instruction:
+            "Revise the operations to resolve every blocking finding, then submit a new plan with the same current brief fingerprint.",
+        };
+      }
       const nextProposal: ArchitectureProposal = {
+        goal: parsed.goal,
         summary: parsed.summary,
+        profileLabel: activeArchitectureProfile.label,
+        assumptions: parsed.assumptions,
+        decisions: parsed.decisions,
+        preflightStatus: preflight.status,
+        preflightScore: preflight.resilienceScore,
+        preflightWarnings: preflight.findings.filter(
+          (finding) => finding.severity !== "critical",
+        ).length,
         changes: preview.changes,
         beforeCost,
         afterCost,
-        maxMonthlyCost: parsed.max_monthly_cost_usdc,
+        maxMonthlyCost: enforcedBudget,
         architectureHash: finalHash,
       };
       logToolEvent(
@@ -2029,6 +2184,9 @@ export function CanvasOpsApp() {
       return result;
     },
     [
+      activeArchitectureProfile.label,
+      architectureBrief,
+      briefFingerprint,
       executePlanStages,
       logToolEvent,
       previewPlan,
@@ -2040,7 +2198,7 @@ export function CanvasOpsApp() {
     {
       name: "analyze_current_architecture",
       description:
-        "Read the complete live graph, positions, configuration, connections, cost, resilience score, and architecture fingerprint. Call before modifying an unfamiliar architecture.",
+        "Read the complete live graph, positions, configuration, connections, cost, resilience score, architecture fingerprint, and active brief identity. Call before modifying an unfamiliar architecture.",
       inputSchema: analyzeArchitectureSchema,
       annotations: { readOnlyHint: true },
       execute: (input) => {
@@ -2055,6 +2213,62 @@ export function CanvasOpsApp() {
       },
     },
     [analyzeArchitecture, logToolEvent],
+  );
+
+  useWebMCP(
+    {
+      name: "get_architecture_context",
+      description:
+        "Required first step before proposing an architecture plan. Returns the human-authored brief, active expert policy, current brief fingerprint, and the exact structured generation contract.",
+      inputSchema: getArchitectureContextSchema,
+      annotations: { readOnlyHint: true },
+      execute: (input) => {
+        const parsed = getArchitectureContextSchema.parse(input);
+        logToolEvent(
+          "get_architecture_context",
+          `Loaded ${activeArchitectureProfile.label} context (${briefFingerprint}).`,
+          parsed,
+        );
+        return {
+          brief: architectureBrief,
+          brief_fingerprint: briefFingerprint,
+          expert_profile: activeArchitectureProfile,
+          generation_contract: {
+            sequence: [
+              "Read this context and the live architecture.",
+              "Reuse existing nodes and supported catalog types.",
+              "Resolve important unknowns with the user before proposing mutations.",
+              "Return the strict propose_architecture_plan payload.",
+              "Revise the plan if deterministic preflight returns needs_revision.",
+            ],
+            required_plan_fields: [
+              "goal",
+              "summary",
+              "profile",
+              "brief_fingerprint",
+              "assumptions",
+              "unresolved_questions",
+              "decisions",
+              "operations",
+            ],
+            rules: [
+              "profile must equal the active brief profile",
+              "brief_fingerprint must exactly match the current brief",
+              "unresolved_questions must be empty before a plan can be reviewed",
+              "every major design choice needs a decision and rationale",
+              "the proposed graph must pass budget, region, replica, connectivity, and reference validation",
+              "preserve components outside the user's explicit scope",
+            ],
+          },
+        };
+      },
+    },
+    [
+      activeArchitectureProfile,
+      architectureBrief,
+      briefFingerprint,
+      logToolEvent,
+    ],
   );
 
   useWebMCP(
@@ -2427,7 +2641,7 @@ export function CanvasOpsApp() {
     {
       name: "propose_architecture_plan",
       description:
-        "Preview a strict multi-operation architecture plan with a cost diff. The human must approve the in-page proposal before changes apply atomically.",
+        "Submit a strict, explainable plan bound to the current architecture brief. Stale context, profile mismatches, unresolved questions, and deterministic preflight failures are rejected before human review. Valid plans require explicit approval and apply atomically.",
       inputSchema: proposeArchitecturePlanSchema,
       annotations: { readOnlyHint: false },
       execute: (input) =>
@@ -2492,11 +2706,11 @@ export function CanvasOpsApp() {
   const liveValidation = useMemo(
     () =>
       validateArchitecture(nodes, edges, {
-        maxMonthlyCost: 300,
-        requiredRegions: ["bom-1", "sin-1"],
-        minimumReplicas: 2,
+        maxMonthlyCost: architectureBrief.maxMonthlyCost,
+        requiredRegions: architectureBrief.requiredRegions,
+        minimumReplicas: architectureBrief.minimumReplicas,
       }),
-    [edges, nodes],
+    [architectureBrief, edges, nodes],
   );
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
@@ -2998,6 +3212,16 @@ export function CanvasOpsApp() {
             Demo Reset
           </Button>
           <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setBriefOpen(true)}
+            disabled={planExecution !== null}
+            title={`Architecture brief ${briefFingerprint}`}
+          >
+            <ClipboardList className="size-3.5" />
+            Brief
+          </Button>
+          <Button
             variant={judgeMode ? "primary" : "secondary"}
             size="sm"
             onClick={() => {
@@ -3353,6 +3577,23 @@ export function CanvasOpsApp() {
                   )}
                 </div>
               </div>
+
+              <button
+                className="architecture-brief-card"
+                onClick={() => setBriefOpen(true)}
+              >
+                <span>
+                  <ClipboardList className="size-3.5" />
+                  Architecture brief
+                </span>
+                <strong>{activeArchitectureProfile.label}</strong>
+                <small>
+                  {architectureBrief.requiredRegions.join(" + ") || "Any region"}
+                  {" · "}${architectureBrief.maxMonthlyCost}/mo
+                  {" · "}{architectureBrief.availabilityTarget}% target
+                </small>
+                <code>{briefFingerprint}</code>
+              </button>
 
               {liveValidation.findings.length > 0 ? (
                 <div className="finding-strip">
@@ -3924,6 +4165,15 @@ export function CanvasOpsApp() {
         onApprove={handleProposalApprove}
         onReject={handleProposalReject}
       />
+      {briefOpen ? (
+        <ArchitectureBriefDialog
+          brief={architectureBrief}
+          fingerprint={briefFingerprint}
+          open
+          onClose={() => setBriefOpen(false)}
+          onSave={saveArchitectureBrief}
+        />
+      ) : null}
       <PaymentDialog
         open={paymentOpen}
         total={paymentTotal}
