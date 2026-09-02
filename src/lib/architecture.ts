@@ -1,5 +1,6 @@
 import type { Edge } from "@xyflow/react";
 import type { InfrastructureNode, InfrastructureType } from "@/lib/infrastructure";
+import { isConnectableType } from "@/lib/infrastructure";
 
 export type ArchitectureConstraint = {
   maxMonthlyCost?: number;
@@ -37,11 +38,18 @@ export function cloneGraph(
     nodes: nodes.map((node) => ({
       ...node,
       position: { ...node.position },
+      style: node.style ? { ...node.style } : node.style,
       data: {
         ...node.data,
+        groupSize: node.data.groupSize
+          ? { ...node.data.groupSize }
+          : node.data.groupSize,
         config: {
           ...node.data.config,
           envVars: { ...node.data.config.envVars },
+          customProperties: { ...node.data.config.customProperties },
+          inputPorts: [...node.data.config.inputPorts],
+          outputPorts: [...node.data.config.outputPorts],
         },
       },
     })),
@@ -62,6 +70,9 @@ export function architectureHash(nodes: InfrastructureNode[], edges: Edge[]) {
         label: node.data.label,
         config: node.data.config,
         monthlyCost: node.data.monthlyCost,
+        position: node.position,
+        parentId: node.parentId,
+        collapsed: node.data.collapsed,
       }))
       .sort((a, b) => a.id.localeCompare(b.id)),
     edges: edges
@@ -94,6 +105,7 @@ export function validateArchitecture(
   const disconnected = nodes
     .filter(
       (node) =>
+        isConnectableType(node.data.type) &&
         !edges.some(
           (edge) => edge.source === node.id || edge.target === node.id,
         ),
@@ -138,7 +150,7 @@ export function validateArchitecture(
 
   const minimumReplicas = constraints.minimumReplicas ?? 2;
   const apiRegions = new Map<string, InfrastructureNode[]>();
-  for (const node of nodes.filter((item) => item.data.type === "api-service")) {
+  for (const node of nodes.filter((item) => item.data.type === "service")) {
     const regionalApis = apiRegions.get(node.data.config.region) ?? [];
     regionalApis.push(node);
     apiRegions.set(node.data.config.region, regionalApis);
@@ -184,7 +196,7 @@ export function validateArchitecture(
       (node) => node.data.config.region === region,
     );
     const hasApi = regionalNodes.some(
-      (node) => node.data.type === "api-service",
+      (node) => node.data.type === "service",
     );
     if (!hasApi) {
       findings.push({
@@ -197,7 +209,12 @@ export function validateArchitecture(
     }
   }
 
-  const dataTypes: InfrastructureType[] = ["database", "storage", "queue"];
+  const dataTypes: InfrastructureType[] = [
+    "database",
+    "cache",
+    "storage",
+    "queue",
+  ];
   for (const type of dataTypes) {
     const resources = nodes.filter((node) => node.data.type === type);
     if (resources.length === 1 && resources[0].data.config.replicas < 2) {
@@ -211,7 +228,13 @@ export function validateArchitecture(
     }
   }
 
-  if (!nodes.some((node) => node.data.config.region === "global")) {
+  if (
+    !nodes.some(
+      (node) =>
+        node.data.type === "api-gateway" ||
+        node.data.config.region === "global",
+    )
+  ) {
     findings.push({
       id: "no-global-entry",
       severity: "warning",
@@ -253,11 +276,19 @@ export function validateArchitecture(
 }
 
 const layerOrder: Record<InfrastructureType, number> = {
-  "edge-worker": 0,
-  "api-service": 1,
+  client: 0,
+  "api-gateway": 1,
+  "load-balancer": 1,
+  "auth-service": 2,
+  service: 2,
+  worker: 3,
   database: 2,
-  storage: 2,
-  queue: 2,
+  cache: 3,
+  storage: 3,
+  queue: 3,
+  "external-system": 4,
+  group: 0,
+  note: 4,
 };
 
 export function autoLayoutArchitecture(
@@ -265,7 +296,8 @@ export function autoLayoutArchitecture(
   direction: "LR" | "TB",
   groupBy: "layer" | "region",
 ) {
-  const sorted = [...nodes].sort((a, b) => {
+  const topLevelNodes = nodes.filter((node) => !node.parentId);
+  const sorted = [...topLevelNodes].sort((a, b) => {
     const primary =
       groupBy === "region"
         ? a.data.config.region.localeCompare(b.data.config.region)
@@ -277,7 +309,8 @@ export function autoLayoutArchitecture(
     new Set(sorted.map((node) => node.data.config.region)),
   ).sort((a, b) => (a === "global" ? -1 : b === "global" ? 1 : a.localeCompare(b)));
 
-  return sorted.map((node) => {
+  const positioned = new Map(
+    sorted.map((node) => {
     const layer = layerOrder[node.data.type];
     const regionIndex = Math.max(0, regions.indexOf(node.data.config.region));
     const key = groupBy === "region" ? node.data.config.region : String(layer);
@@ -288,9 +321,14 @@ export function autoLayoutArchitecture(
     const logicalY = index;
     const x = 80 + logicalX * 340;
     const y = 100 + logicalY * 150;
-    return {
-      ...node,
-      position: direction === "LR" ? { x, y } : { x: y, y: x },
-    };
-  });
+      return [
+        node.id,
+        {
+          ...node,
+          position: direction === "LR" ? { x, y } : { x: y, y: x },
+        },
+      ];
+    }),
+  );
+  return nodes.map((node) => positioned.get(node.id) ?? node);
 }

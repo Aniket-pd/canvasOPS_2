@@ -1,10 +1,16 @@
 "use client";
 
 import {
+  Cloud,
+  Cog,
   Database,
   HardDrive,
+  Layers3,
+  Monitor,
   RadioTower,
   ServerCog,
+  ShieldCheck,
+  StickyNote,
   Workflow,
 } from "lucide-react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
@@ -15,11 +21,19 @@ import {
 } from "@/lib/infrastructure";
 
 const icons = {
-  "edge-worker": RadioTower,
-  "api-service": ServerCog,
+  client: Monitor,
+  service: ServerCog,
+  "api-gateway": RadioTower,
+  "load-balancer": Workflow,
   database: Database,
+  cache: HardDrive,
   storage: HardDrive,
   queue: Workflow,
+  "external-system": Cloud,
+  "auth-service": ShieldCheck,
+  worker: Cog,
+  group: Layers3,
+  note: StickyNote,
 };
 
 export function InfrastructureNodeCard({
@@ -30,6 +44,44 @@ export function InfrastructureNodeCard({
   const catalog = infrastructureCatalog[data.type];
   const Icon = icons[data.type];
 
+  if (data.type === "group") {
+    return (
+      <div
+        className="system-group-node"
+        data-collapsed={data.collapsed ? "true" : "false"}
+        data-selected={selected ? "true" : "false"}
+        style={{ "--node-accent": catalog.accent } as React.CSSProperties}
+      >
+        <div className="system-group-title">
+          <Icon className="size-4" />
+          <strong>{data.label}</strong>
+          <code>{nodeReference(id)}</code>
+          <span>{data.collapsed ? "Collapsed" : "System boundary"}</span>
+        </div>
+        {!data.collapsed ? (
+          <p>{data.config.description || catalog.description}</p>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (data.type === "note") {
+    return (
+      <div
+        className="design-note-node"
+        data-selected={selected ? "true" : "false"}
+        style={{ "--node-accent": catalog.accent } as React.CSSProperties}
+      >
+        <div>
+          <Icon className="size-4" />
+          <strong>{data.label}</strong>
+          <code>{nodeReference(id)}</code>
+        </div>
+        <p>{data.config.description || "Add a design decision or requirement."}</p>
+      </div>
+    );
+  }
+
   return (
     <div
       className="infrastructure-node"
@@ -37,7 +89,9 @@ export function InfrastructureNodeCard({
       data-status={data.status}
       style={{ "--node-accent": catalog.accent } as React.CSSProperties}
     >
-      <Handle type="target" position={Position.Left} />
+      {catalog.connectable ? (
+        <Handle type="target" position={Position.Left} />
+      ) : null}
       <div className="node-icon">
         <Icon className="size-4" strokeWidth={1.9} />
       </div>
@@ -50,8 +104,7 @@ export function InfrastructureNodeCard({
         </div>
         <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
           <span className="status-dot" />
-          {data.config.region} · {data.config.replicas} replica
-          {data.config.replicas === 1 ? "" : "s"}
+          {data.config.technology} · {data.config.region}
         </div>
       </div>
       <div className="text-right">
@@ -60,7 +113,9 @@ export function InfrastructureNodeCard({
         </div>
         <div className="text-[9px] text-zinc-600">/mo</div>
       </div>
-      <Handle type="source" position={Position.Right} />
+      {catalog.connectable ? (
+        <Handle type="source" position={Position.Right} />
+      ) : null}
     </div>
   );
 }

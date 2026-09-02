@@ -35,6 +35,7 @@ import {
   ChevronDown,
   CircleDollarSign,
   Cloud,
+  Cog,
   Copy,
   Database,
   GripVertical,
@@ -43,6 +44,7 @@ import {
   Layers3,
   Link2,
   LayoutDashboard,
+  Monitor,
   MonitorPlay,
   MousePointer2,
   RadioTower,
@@ -51,6 +53,7 @@ import {
   Settings2,
   ShieldCheck,
   Sparkles,
+  StickyNote,
   Trash2,
   Workflow,
   X,
@@ -93,6 +96,8 @@ import {
   infrastructureTypes,
   initialEdges,
   initialNodes,
+  isConnectableType,
+  migrateInfrastructureNodes,
   monthlyCostFor,
   nodeReference,
   type InfrastructureConfig,
@@ -110,11 +115,21 @@ const configSchema = z
     size: z.string().min(2).max(40).optional(),
     replicas: z.number().int().min(1).max(12).optional(),
     env_vars: z.record(z.string().min(1).max(64), z.string().max(500)).optional(),
+    technology: z.string().min(1).max(80).optional(),
+    description: z.string().max(500).optional(),
+    owner: z.string().min(1).max(80).optional(),
+    environment: z.string().min(1).max(40).optional(),
+    custom_properties: z
+      .record(z.string().min(1).max(64), z.string().max(500))
+      .optional(),
+    input_ports: z.array(z.string().min(1).max(64)).max(16).optional(),
+    output_ports: z.array(z.string().min(1).max(64)).max(16).optional(),
     label: z.string().min(1).max(64).optional(),
   })
   .strict();
 
 const analyzeArchitectureSchema = z.object({}).strict();
+const getComponentCatalogSchema = z.object({}).strict();
 const getSelectionContextSchema = z.object({}).strict();
 const addInfrastructureNodeSchema = z
   .object({
@@ -128,7 +143,13 @@ const connectNodesSchema = z
   .object({
     source_id: z.string().min(1).max(128),
     target_id: z.string().min(1).max(128),
-    connection_type: z.enum(["data", "request", "event", "replication"]),
+    connection_type: z.enum([
+      "data",
+      "request",
+      "event",
+      "replication",
+      "dependency",
+    ]),
   })
   .strict();
 const disconnectNodesSchema = z
@@ -154,18 +175,40 @@ const updateNodeConfigSchema = z
     size: z.string().min(2).max(40).optional(),
     replicas: z.number().int().min(1).max(12).optional(),
     env_vars: z.record(z.string().min(1).max(64), z.string().max(500)).optional(),
+    technology: z.string().min(1).max(80).optional(),
+    description: z.string().max(500).optional(),
+    owner: z.string().min(1).max(80).optional(),
+    environment: z.string().min(1).max(40).optional(),
+    custom_properties: z
+      .record(z.string().min(1).max(64), z.string().max(500))
+      .optional(),
+    input_ports: z.array(z.string().min(1).max(64)).max(16).optional(),
+    output_ports: z.array(z.string().min(1).max(64)).max(16).optional(),
     label: z.string().min(1).max(64).optional(),
   })
   .strict()
   .refine(
-    ({ region, size, replicas, env_vars, label }) =>
-      region !== undefined ||
-      size !== undefined ||
-      replicas !== undefined ||
-      env_vars !== undefined ||
-      label !== undefined,
+    (input) => Object.entries(input).some(([key, value]) => key !== "node_id" && value !== undefined),
     { message: "Provide at least one configuration field." },
   );
+const groupNodesSchema = z
+  .object({
+    node_ids: z.array(z.string().min(1).max(128)).min(1).max(24),
+    label: z.string().min(1).max(64).default("System Boundary"),
+  })
+  .strict();
+const setGroupMembersSchema = z
+  .object({
+    group_id: z.string().min(1).max(128),
+    node_ids: z.array(z.string().min(1).max(128)).max(24),
+  })
+  .strict();
+const setGroupCollapsedSchema = z
+  .object({
+    group_id: z.string().min(1).max(128),
+    collapsed: z.boolean(),
+  })
+  .strict();
 const autoLayoutSchema = z
   .object({
     direction: z.enum(["LR", "TB"]).default("LR"),
@@ -223,7 +266,13 @@ const planOperationSchema = z.discriminatedUnion("action", [
       action: z.literal("connect_nodes"),
       source_ref: z.string().min(1).max(128),
       target_ref: z.string().min(1).max(128),
-      connection_type: z.enum(["data", "request", "event", "replication"]),
+      connection_type: z.enum([
+        "data",
+        "request",
+        "event",
+        "replication",
+        "dependency",
+      ]),
     })
     .strict(),
   z
@@ -238,6 +287,28 @@ const planOperationSchema = z.discriminatedUnion("action", [
       action: z.literal("update_node"),
       node_id: z.string().min(1).max(128),
       config: configSchema,
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("group_nodes"),
+      ref: z.string().min(1).max(64),
+      label: z.string().min(1).max(64),
+      node_refs: z.array(z.string().min(1).max(128)).min(1).max(24),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_group_members"),
+      group_ref: z.string().min(1).max(128),
+      node_refs: z.array(z.string().min(1).max(128)).max(24),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal("set_group_collapsed"),
+      group_ref: z.string().min(1).max(128),
+      collapsed: z.boolean(),
     })
     .strict(),
 ]);
@@ -322,6 +393,12 @@ function planOperationToolName(operation: PlanInput["operations"][number]) {
       return "add_infrastructure_node";
     case "update_node":
       return "update_node_config";
+    case "group_nodes":
+      return "group_nodes";
+    case "set_group_members":
+      return "set_group_members";
+    case "set_group_collapsed":
+      return "set_group_collapsed";
     default:
       return operation.action;
   }
@@ -331,11 +408,19 @@ const paletteIcons: Record<
   InfrastructureType,
   React.ComponentType<{ className?: string }>
 > = {
-  "edge-worker": RadioTower,
-  "api-service": ServerCog,
+  client: Monitor,
+  service: ServerCog,
+  "api-gateway": RadioTower,
+  "load-balancer": Workflow,
   database: Database,
+  cache: HardDrive,
   storage: HardDrive,
   queue: Workflow,
+  "external-system": Cloud,
+  "auth-service": ShieldCheck,
+  worker: Cog,
+  group: Layers3,
+  note: StickyNote,
 };
 
 const judgeSteps: JudgeStep[] = [
@@ -369,6 +454,7 @@ const browserPrompts = judgeSteps.map((step) => step.prompt);
 
 const registeredToolNames = [
   "analyze_current_architecture",
+  "get_component_catalog",
   "get_selection_context",
   "validate_architecture",
   "propose_architecture_plan",
@@ -378,6 +464,9 @@ const registeredToolNames = [
   "connect_nodes",
   "disconnect_nodes",
   "update_node_config",
+  "group_nodes",
+  "set_group_members",
+  "set_group_collapsed",
   "auto_layout_architecture",
   "simulate_region_outage",
   "undo_last_change",
@@ -423,6 +512,175 @@ function resolveNodeId(reference: string, nodes: InfrastructureNode[]) {
     );
   }
   throw new Error(`Node reference “${reference}” does not exist.`);
+}
+
+const DEFAULT_NODE_WIDTH = 210;
+const DEFAULT_NODE_HEIGHT = 66;
+const GROUP_PADDING_X = 54;
+const GROUP_PADDING_TOP = 84;
+const GROUP_PADDING_BOTTOM = 44;
+
+function absoluteNodePosition(
+  node: InfrastructureNode,
+  nodes: InfrastructureNode[],
+) {
+  let x = node.position.x;
+  let y = node.position.y;
+  let parentId = node.parentId;
+  const visited = new Set<string>();
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    const parent = nodes.find((candidate) => candidate.id === parentId);
+    if (!parent) break;
+    x += parent.position.x;
+    y += parent.position.y;
+    parentId = parent.parentId;
+  }
+  return { x, y };
+}
+
+function withoutParent(
+  node: InfrastructureNode,
+  position: { x: number; y: number },
+): InfrastructureNode {
+  const detachedNode: InfrastructureNode = {
+    ...node,
+    position,
+    hidden: false,
+  };
+  delete detachedNode.parentId;
+  delete detachedNode.extent;
+  delete detachedNode.expandParent;
+  return detachedNode;
+}
+
+function applyGroupMembership(
+  nodes: InfrastructureNode[],
+  groupId: string,
+  memberIds: string[],
+) {
+  const group = nodes.find((node) => node.id === groupId);
+  if (!group || group.data.type !== "group") {
+    throw new Error(`${groupId} is not a system boundary.`);
+  }
+  const desiredIds = new Set(
+    memberIds.filter((id) => {
+      const node = nodes.find((candidate) => candidate.id === id);
+      return node && node.id !== groupId && node.data.type !== "group";
+    }),
+  );
+  const absolutePositions = new Map(
+    nodes.map((node) => [node.id, absoluteNodePosition(node, nodes)]),
+  );
+  const desiredNodes = nodes.filter((node) => desiredIds.has(node.id));
+  const currentGroupPosition = absolutePositions.get(group.id) ?? group.position;
+  const minX =
+    desiredNodes.length > 0
+      ? Math.min(
+          ...desiredNodes.map(
+            (node) => absolutePositions.get(node.id)?.x ?? node.position.x,
+          ),
+        )
+      : currentGroupPosition.x + GROUP_PADDING_X;
+  const minY =
+    desiredNodes.length > 0
+      ? Math.min(
+          ...desiredNodes.map(
+            (node) => absolutePositions.get(node.id)?.y ?? node.position.y,
+          ),
+        )
+      : currentGroupPosition.y + GROUP_PADDING_TOP;
+  const maxX =
+    desiredNodes.length > 0
+      ? Math.max(
+          ...desiredNodes.map(
+            (node) =>
+              (absolutePositions.get(node.id)?.x ?? node.position.x) +
+              DEFAULT_NODE_WIDTH,
+          ),
+        )
+      : minX + 420;
+  const maxY =
+    desiredNodes.length > 0
+      ? Math.max(
+          ...desiredNodes.map(
+            (node) =>
+              (absolutePositions.get(node.id)?.y ?? node.position.y) +
+              DEFAULT_NODE_HEIGHT,
+          ),
+        )
+      : minY + 190;
+  const groupPosition = {
+    x: minX - GROUP_PADDING_X,
+    y: minY - GROUP_PADDING_TOP,
+  };
+  const groupSize = {
+    width: Math.max(420, maxX - minX + GROUP_PADDING_X * 2),
+    height: Math.max(
+      250,
+      maxY - minY + GROUP_PADDING_TOP + GROUP_PADDING_BOTTOM,
+    ),
+  };
+
+  return nodes
+    .map((node) => {
+      if (node.id === groupId) {
+        return {
+          ...withoutParent(node, groupPosition),
+          style: node.data.collapsed
+            ? { ...node.style, width: 280, height: 72 }
+            : { ...node.style, ...groupSize },
+          data: { ...node.data, groupSize },
+        } satisfies InfrastructureNode;
+      }
+      const absolute = absolutePositions.get(node.id) ?? node.position;
+      if (desiredIds.has(node.id)) {
+        return {
+          ...node,
+          parentId: groupId,
+          extent: "parent" as const,
+          expandParent: false,
+          position: {
+            x: absolute.x - groupPosition.x,
+            y: absolute.y - groupPosition.y,
+          },
+          hidden: Boolean(group.data.collapsed),
+          zIndex: 1,
+        } satisfies InfrastructureNode;
+      }
+      if (node.parentId === groupId) return withoutParent(node, absolute);
+      return node;
+    })
+    .sort((a, b) => {
+      if (a.data.type === "group" && b.data.type !== "group") return -1;
+      if (a.data.type !== "group" && b.data.type === "group") return 1;
+      return 0;
+    });
+}
+
+function setGroupCollapsedState(
+  nodes: InfrastructureNode[],
+  groupId: string,
+  collapsed: boolean,
+) {
+  const group = nodes.find((node) => node.id === groupId);
+  if (!group || group.data.type !== "group") {
+    throw new Error(`${groupId} is not a system boundary.`);
+  }
+  const size = group.data.groupSize ?? { width: 620, height: 360 };
+  return nodes.map((node) => {
+    if (node.id === groupId) {
+      return {
+        ...node,
+        style: collapsed
+          ? { ...node.style, width: 280, height: 72 }
+          : { ...node.style, ...size },
+        data: { ...node.data, collapsed },
+      } satisfies InfrastructureNode;
+    }
+    if (node.parentId === groupId) return { ...node, hidden: collapsed };
+    return node;
+  });
 }
 
 function wait(milliseconds: number) {
@@ -533,8 +791,20 @@ export function CanvasOpsApp() {
           const previous = beforeNodes.get(node.id);
           return (
             previous !== undefined &&
-            JSON.stringify({ data: previous.data, position: previous.position }) !==
-              JSON.stringify({ data: node.data, position: node.position })
+            JSON.stringify({
+              data: previous.data,
+              position: previous.position,
+              parentId: previous.parentId,
+              hidden: previous.hidden,
+              style: previous.style,
+            }) !==
+              JSON.stringify({
+                data: node.data,
+                position: node.position,
+                parentId: node.parentId,
+                hidden: node.hidden,
+                style: node.style,
+              })
           );
         })
         .map((node) => node.id);
@@ -617,8 +887,9 @@ export function CanvasOpsApp() {
           edges: Edge[];
         };
         if (Array.isArray(parsed.nodes) && Array.isArray(parsed.edges)) {
-          applyGraph(parsed.nodes, parsed.edges);
-          nextIdRef.current = nextNodeId(parsed.nodes);
+          const migratedNodes = migrateInfrastructureNodes(parsed.nodes);
+          applyGraph(migratedNodes, parsed.edges);
+          nextIdRef.current = nextNodeId(migratedNodes);
         }
       }
     } catch {
@@ -692,10 +963,26 @@ export function CanvasOpsApp() {
             size: input.config?.size ?? baseConfig.size,
             replicas,
             envVars: input.config?.env_vars ?? baseConfig.envVars,
+            technology: input.config?.technology ?? baseConfig.technology,
+            description: input.config?.description ?? baseConfig.description,
+            owner: input.config?.owner ?? baseConfig.owner,
+            environment: input.config?.environment ?? baseConfig.environment,
+            customProperties:
+              input.config?.custom_properties ?? baseConfig.customProperties,
+            inputPorts: input.config?.input_ports ?? baseConfig.inputPorts,
+            outputPorts: input.config?.output_ports ?? baseConfig.outputPorts,
           },
           monthlyCost: monthlyCostFor(input.type, replicas),
           status: "healthy" as const,
+          collapsed: false,
+          groupSize:
+            input.type === "group"
+              ? { width: 620, height: 360 }
+              : undefined,
         },
+        connectable: catalog.connectable,
+        style:
+          input.type === "group" ? { width: 620, height: 360 } : undefined,
       } satisfies InfrastructureNode;
     },
     [],
@@ -724,6 +1011,17 @@ export function CanvasOpsApp() {
     (input: z.infer<typeof connectNodesSchema>) => {
       const sourceId = resolveNodeId(input.source_id, nodesRef.current);
       const targetId = resolveNodeId(input.target_id, nodesRef.current);
+      if (sourceId === targetId) throw new Error("A node cannot connect to itself.");
+      const sourceNode = nodesRef.current.find((node) => node.id === sourceId);
+      const targetNode = nodesRef.current.find((node) => node.id === targetId);
+      if (
+        !sourceNode ||
+        !targetNode ||
+        !isConnectableType(sourceNode.data.type) ||
+        !isConnectableType(targetNode.data.type)
+      ) {
+        throw new Error("System boundaries and notes cannot be connection endpoints.");
+      }
       const duplicate = edgesRef.current.some(
         (edge) => edge.source === sourceId && edge.target === targetId,
       );
@@ -797,9 +1095,36 @@ export function CanvasOpsApp() {
       const nodeId = resolveNodeId(input.node_id, nodesRef.current);
       const target = nodesRef.current.find((node) => node.id === nodeId);
       if (!target) throw new Error(`Node ${nodeId} does not exist.`);
-      const nextNodes = nodesRef.current.filter(
-        (node) => node.id !== nodeId,
+      const absolutePositions = new Map(
+        nodesRef.current.map((node) => [
+          node.id,
+          absoluteNodePosition(node, nodesRef.current),
+        ]),
       );
+      let nextNodes = nodesRef.current
+        .filter((node) => node.id !== nodeId)
+        .map((node) =>
+          target.data.type === "group" && node.parentId === nodeId
+            ? withoutParent(
+                node,
+                absolutePositions.get(node.id) ?? node.position,
+              )
+            : node,
+        );
+      if (target.parentId) {
+        const parentStillExists = nextNodes.some(
+          (node) => node.id === target.parentId && node.data.type === "group",
+        );
+        if (parentStillExists) {
+          nextNodes = applyGroupMembership(
+            nextNodes,
+            target.parentId,
+            nextNodes
+              .filter((node) => node.parentId === target.parentId)
+              .map((node) => node.id),
+          );
+        }
+      }
       const nextEdges = edgesRef.current.filter(
         (edge) =>
           edge.source !== nodeId && edge.target !== nodeId,
@@ -838,6 +1163,19 @@ export function CanvasOpsApp() {
               envVars: input.env_vars
                 ? { ...node.data.config.envVars, ...input.env_vars }
                 : node.data.config.envVars,
+              technology: input.technology ?? node.data.config.technology,
+              description: input.description ?? node.data.config.description,
+              owner: input.owner ?? node.data.config.owner,
+              environment:
+                input.environment ?? node.data.config.environment,
+              customProperties: input.custom_properties
+                ? {
+                    ...node.data.config.customProperties,
+                    ...input.custom_properties,
+                  }
+                : node.data.config.customProperties,
+              inputPorts: input.input_ports ?? node.data.config.inputPorts,
+              outputPorts: input.output_ports ?? node.data.config.outputPorts,
             },
           },
         };
@@ -851,6 +1189,93 @@ export function CanvasOpsApp() {
           nextNodes.find((node) => node.id === nodeId)?.data.monthlyCost ??
           0,
       };
+    },
+    [commitGraph],
+  );
+
+  const groupInfrastructureNodes = useCallback(
+    (input: z.infer<typeof groupNodesSchema>) => {
+      const memberIds = Array.from(
+        new Set(
+          input.node_ids.map((reference) =>
+            resolveNodeId(reference, nodesRef.current),
+          ),
+        ),
+      );
+      if (
+        memberIds.some(
+          (id) =>
+            nodesRef.current.find((node) => node.id === id)?.data.type ===
+            "group",
+        )
+      ) {
+        throw new Error("System boundaries cannot be nested.");
+      }
+      const group = createNode({
+        type: "group",
+        x: 0,
+        y: 0,
+        config: { label: input.label },
+      });
+      const nextNodes = applyGroupMembership(
+        [...nodesRef.current, group],
+        group.id,
+        memberIds,
+      );
+      commitGraph(
+        `Grouped ${memberIds.length} component${memberIds.length === 1 ? "" : "s"} as ${input.label}`,
+        nextNodes,
+        edgesRef.current,
+      );
+      return {
+        success: true,
+        group_id: group.id,
+        group_reference: nodeReference(group.id),
+        member_node_ids: memberIds,
+      };
+    },
+    [commitGraph, createNode],
+  );
+
+  const setInfrastructureGroupMembers = useCallback(
+    (input: z.infer<typeof setGroupMembersSchema>) => {
+      const groupId = resolveNodeId(input.group_id, nodesRef.current);
+      const memberIds = Array.from(
+        new Set(
+          input.node_ids.map((reference) =>
+            resolveNodeId(reference, nodesRef.current),
+          ),
+        ),
+      );
+      const nextNodes = applyGroupMembership(
+        nodesRef.current,
+        groupId,
+        memberIds,
+      );
+      commitGraph(
+        `Updated ${nodeReference(groupId)} membership`,
+        nextNodes,
+        edgesRef.current,
+      );
+      return { success: true, group_id: groupId, member_node_ids: memberIds };
+    },
+    [commitGraph],
+  );
+
+  const setInfrastructureGroupCollapsed = useCallback(
+    (input: z.infer<typeof setGroupCollapsedSchema>) => {
+      const groupId = resolveNodeId(input.group_id, nodesRef.current);
+      const nextNodes = setGroupCollapsedState(
+        nodesRef.current,
+        groupId,
+        input.collapsed,
+      );
+      commitGraph(
+        `${input.collapsed ? "Collapsed" : "Expanded"} ${nodeReference(groupId)}`,
+        nextNodes,
+        edgesRef.current,
+      );
+      return { success: true, group_id: groupId, collapsed: input.collapsed };
     },
     [commitGraph],
   );
@@ -873,6 +1298,8 @@ export function CanvasOpsApp() {
         type: node.data.type,
         label: node.data.label,
         position: node.position,
+        parent_group_id: node.parentId ?? null,
+        collapsed: node.data.type === "group" ? Boolean(node.data.collapsed) : undefined,
         config: node.data.config,
         status: node.data.status,
         monthly_cost_usdc: node.data.monthlyCost,
@@ -911,6 +1338,7 @@ export function CanvasOpsApp() {
         label: node.data.label,
         type: node.data.type,
         position: node.position,
+        parent_group_id: node.parentId ?? null,
         config: node.data.config,
       })),
       related_connections: selectedEdges.map((edge) => ({
@@ -1021,7 +1449,7 @@ export function CanvasOpsApp() {
       const failoverNodeIds = nodesRef.current
         .filter(
           (node) =>
-            node.data.type === "api-service" &&
+            node.data.type === "service" &&
             node.data.config.region !== input.region &&
             node.data.status !== "warning",
         )
@@ -1113,9 +1541,23 @@ export function CanvasOpsApp() {
           changes.push(`Move ${nodeReference(nodeId)} to a clear position`);
         } else if (operation.action === "remove_node") {
           const nodeId = resolveRef(operation.node_id);
-          simulatedNodes = simulatedNodes.filter(
-            (node) => node.id !== nodeId,
+          const target = simulatedNodes.find((node) => node.id === nodeId);
+          const absolutePositions = new Map(
+            simulatedNodes.map((node) => [
+              node.id,
+              absoluteNodePosition(node, simulatedNodes),
+            ]),
           );
+          simulatedNodes = simulatedNodes
+            .filter((node) => node.id !== nodeId)
+            .map((node) =>
+              target?.data.type === "group" && node.parentId === nodeId
+                ? withoutParent(
+                    node,
+                    absolutePositions.get(node.id) ?? node.position,
+                  )
+                : node,
+            );
           simulatedEdges = simulatedEdges.filter(
             (edge) =>
               edge.source !== nodeId && edge.target !== nodeId,
@@ -1129,6 +1571,18 @@ export function CanvasOpsApp() {
             !simulatedNodes.some((node) => node.id === target)
           ) {
             throw new Error("Plan connection references an unknown node.");
+          }
+          const sourceNode = simulatedNodes.find((node) => node.id === source);
+          const targetNode = simulatedNodes.find((node) => node.id === target);
+          if (
+            !sourceNode ||
+            !targetNode ||
+            !isConnectableType(sourceNode.data.type) ||
+            !isConnectableType(targetNode.data.type)
+          ) {
+            throw new Error(
+              "System boundaries and notes cannot be connection endpoints.",
+            );
           }
           if (
             !simulatedEdges.some(
@@ -1162,6 +1616,49 @@ export function CanvasOpsApp() {
           changes.push(
             `Disconnect ${nodeReference(sourceId)} → ${nodeReference(targetId)}`,
           );
+        } else if (operation.action === "group_nodes") {
+          if (aliases.has(operation.ref)) {
+            throw new Error(`Duplicate plan ref: ${operation.ref}.`);
+          }
+          const memberIds = operation.node_refs.map(resolveRef);
+          const id = `group-${simulatedId++}`;
+          aliases.set(operation.ref, id);
+          const group = createNode(
+            {
+              type: "group",
+              x: 0,
+              y: 0,
+              config: { label: operation.label },
+            },
+            id,
+          );
+          simulatedNodes = applyGroupMembership(
+            [...simulatedNodes, group],
+            id,
+            memberIds,
+          );
+          changes.push(
+            `Group ${memberIds.map(nodeReference).join(", ")} as ${operation.label}`,
+          );
+        } else if (operation.action === "set_group_members") {
+          const groupId = resolveRef(operation.group_ref);
+          const memberIds = operation.node_refs.map(resolveRef);
+          simulatedNodes = applyGroupMembership(
+            simulatedNodes,
+            groupId,
+            memberIds,
+          );
+          changes.push(`Update ${nodeReference(groupId)} membership`);
+        } else if (operation.action === "set_group_collapsed") {
+          const groupId = resolveRef(operation.group_ref);
+          simulatedNodes = setGroupCollapsedState(
+            simulatedNodes,
+            groupId,
+            operation.collapsed,
+          );
+          changes.push(
+            `${operation.collapsed ? "Collapse" : "Expand"} ${nodeReference(groupId)}`,
+          );
         } else {
           const nodeId = resolveRef(operation.node_id);
           const target = simulatedNodes.find(
@@ -1187,8 +1684,30 @@ export function CanvasOpsApp() {
                     ? {
                         ...node.data.config.envVars,
                         ...operation.config.env_vars,
-                      }
+                    }
                     : node.data.config.envVars,
+                  technology:
+                    operation.config.technology ??
+                    node.data.config.technology,
+                  description:
+                    operation.config.description ??
+                    node.data.config.description,
+                  owner: operation.config.owner ?? node.data.config.owner,
+                  environment:
+                    operation.config.environment ??
+                    node.data.config.environment,
+                  customProperties: operation.config.custom_properties
+                    ? {
+                        ...node.data.config.customProperties,
+                        ...operation.config.custom_properties,
+                      }
+                    : node.data.config.customProperties,
+                  inputPorts:
+                    operation.config.input_ports ??
+                    node.data.config.inputPorts,
+                  outputPorts:
+                    operation.config.output_ports ??
+                    node.data.config.outputPorts,
                 },
               },
             };
@@ -1540,6 +2059,34 @@ export function CanvasOpsApp() {
 
   useWebMCP(
     {
+      name: "get_component_catalog",
+      description:
+        "Read the complete supported semantic component vocabulary and defaults. Call before designing or expanding an architecture. Use these types exactly and never invent unsupported component types.",
+      inputSchema: getComponentCatalogSchema,
+      annotations: { readOnlyHint: true },
+      execute: (input) => {
+        const parsed = getComponentCatalogSchema.parse(input);
+        const components = infrastructureTypes.map((type) => ({
+          type,
+          ...infrastructureCatalog[type],
+        }));
+        logToolEvent(
+          "get_component_catalog",
+          `Read ${components.length} supported semantic component types.`,
+          parsed,
+        );
+        return {
+          components,
+          instruction:
+            "Use existing canvas components before creating new ones. Create only component types listed here; express providers and products through technology and custom properties.",
+        };
+      },
+    },
+    [logToolEvent],
+  );
+
+  useWebMCP(
+    {
       name: "get_selection_context",
       description:
         "Read the user's current node and connection selection. Call when the user says this, selected, these nodes, or refers to the current focus.",
@@ -1602,7 +2149,7 @@ export function CanvasOpsApp() {
     {
       name: "add_infrastructure_node",
       description:
-        "Add exactly one cloud component at deterministic coordinates. Analyze first to avoid overlap. For multi-step changes, prefer propose_architecture_plan.",
+        "Add exactly one supported semantic component from the shared catalog at deterministic coordinates. Never invent a type outside the schema. Analyze first to avoid overlap; for multi-step changes, prefer propose_architecture_plan.",
       inputSchema: addInfrastructureNodeSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1709,7 +2256,7 @@ export function CanvasOpsApp() {
     {
       name: "update_node_config",
       description:
-        "Update a node label, region, instance size, replicas, and/or environment variables. node_id accepts an ID, short reference, or unambiguous label. Cost is recalculated from replicas.",
+        "Update a node's common semantic metadata, label, technology, ownership, environment, ports, region, sizing, replicas, custom properties, and/or environment variables. node_id accepts an ID, short reference, or unambiguous label.",
       inputSchema: updateNodeConfigSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1724,6 +2271,69 @@ export function CanvasOpsApp() {
       },
     },
     [logToolEvent, updateInfrastructureNode],
+  );
+
+  useWebMCP(
+    {
+      name: "group_nodes",
+      description:
+        "Create a system boundary around existing nodes. Boundaries cannot be nested. References accept permanent IDs, short references, or unambiguous labels.",
+      inputSchema: groupNodesSchema,
+      annotations: { readOnlyHint: false },
+      execute: (input) => {
+        const parsed = groupNodesSchema.parse(input);
+        const result = groupInfrastructureNodes(parsed);
+        logToolEvent(
+          "group_nodes",
+          `Created ${result.group_reference} around ${result.member_node_ids.length} component(s).`,
+          parsed,
+        );
+        return result;
+      },
+    },
+    [groupInfrastructureNodes, logToolEvent],
+  );
+
+  useWebMCP(
+    {
+      name: "set_group_members",
+      description:
+        "Replace the complete member list of an existing system boundary. Omitted previous members are safely detached, not deleted.",
+      inputSchema: setGroupMembersSchema,
+      annotations: { readOnlyHint: false },
+      execute: (input) => {
+        const parsed = setGroupMembersSchema.parse(input);
+        const result = setInfrastructureGroupMembers(parsed);
+        logToolEvent(
+          "set_group_members",
+          `Updated ${nodeReference(result.group_id)} to ${result.member_node_ids.length} member(s).`,
+          parsed,
+        );
+        return result;
+      },
+    },
+    [logToolEvent, setInfrastructureGroupMembers],
+  );
+
+  useWebMCP(
+    {
+      name: "set_group_collapsed",
+      description:
+        "Collapse or expand a system boundary without deleting its members or connections.",
+      inputSchema: setGroupCollapsedSchema,
+      annotations: { readOnlyHint: false },
+      execute: (input) => {
+        const parsed = setGroupCollapsedSchema.parse(input);
+        const result = setInfrastructureGroupCollapsed(parsed);
+        logToolEvent(
+          "set_group_collapsed",
+          `${parsed.collapsed ? "Collapsed" : "Expanded"} ${nodeReference(result.group_id)}.`,
+          parsed,
+        );
+        return result;
+      },
+    },
+    [logToolEvent, setInfrastructureGroupCollapsed],
   );
 
   useWebMCP(
@@ -1913,7 +2523,7 @@ export function CanvasOpsApp() {
     );
     const failoverNodes = nodes.filter(
       (node) =>
-        node.data.type === "api-service" &&
+        node.data.type === "service" &&
         node.data.config.region !== activeOutage &&
         !affectedNodeIds.has(node.id),
     );
@@ -1992,6 +2602,21 @@ export function CanvasOpsApp() {
   const handleConnect = useCallback(
     (connection: Connection) => {
       if (!connection.source || !connection.target) return;
+      if (connection.source === connection.target) return;
+      const sourceNode = nodesRef.current.find(
+        (node) => node.id === connection.source,
+      );
+      const targetNode = nodesRef.current.find(
+        (node) => node.id === connection.target,
+      );
+      if (
+        !sourceNode ||
+        !targetNode ||
+        !isConnectableType(sourceNode.data.type) ||
+        !isConnectableType(targetNode.data.type)
+      ) {
+        return;
+      }
       const nextEdges = addEdge(
         {
           ...connection,
@@ -2043,7 +2668,49 @@ export function CanvasOpsApp() {
           .map((change) => change.id),
       );
       if (removedIds.size > 0) {
-        const nextNodes = applyNodeChanges(changes, nodesRef.current);
+        const removedGroups = new Set(
+          nodesRef.current
+            .filter(
+              (node) =>
+                removedIds.has(node.id) && node.data.type === "group",
+            )
+            .map((node) => node.id),
+        );
+        const absolutePositions = new Map(
+          nodesRef.current.map((node) => [
+            node.id,
+            absoluteNodePosition(node, nodesRef.current),
+          ]),
+        );
+        let nextNodes = applyNodeChanges(changes, nodesRef.current).map(
+          (node) =>
+            node.parentId && removedGroups.has(node.parentId)
+              ? withoutParent(
+                  node,
+                  absolutePositions.get(node.id) ?? node.position,
+                )
+              : node,
+        );
+        const affectedParentIds = new Set(
+          nodesRef.current
+            .filter(
+              (node) =>
+                removedIds.has(node.id) &&
+                node.parentId &&
+                !removedGroups.has(node.parentId),
+            )
+            .map((node) => node.parentId as string),
+        );
+        for (const parentId of affectedParentIds) {
+          if (!nextNodes.some((node) => node.id === parentId)) continue;
+          nextNodes = applyGroupMembership(
+            nextNodes,
+            parentId,
+            nextNodes
+              .filter((node) => node.parentId === parentId)
+              .map((node) => node.id),
+          );
+        }
         const nextEdges = edgesRef.current.filter(
           (edge) =>
             !removedIds.has(edge.source) && !removedIds.has(edge.target),
@@ -2132,6 +2799,22 @@ export function CanvasOpsApp() {
     },
     [addInfrastructureNode, flow],
   );
+
+  const handleGroupSelection = useCallback(() => {
+    const groupableIds = selectedNodeIdsRef.current.filter(
+      (id) =>
+        nodesRef.current.find((node) => node.id === id)?.data.type !== "group",
+    );
+    if (groupableIds.length === 0) return;
+    const result = groupInfrastructureNodes({
+      node_ids: groupableIds,
+      label: "System Boundary",
+    });
+    setSelectedNodeIds([result.group_id]);
+    setSelectedNodeId(result.group_id);
+    setSelectedEdgeId(null);
+    setRightPanel("config");
+  }, [groupInfrastructureNodes]);
 
   const updateSelectedConfig = useCallback(
     (patch: Partial<InfrastructureConfig>) => {
@@ -2345,7 +3028,7 @@ export function CanvasOpsApp() {
       <section className="workspace">
         <aside className="palette-panel">
           <div className="panel-heading">
-            <span>Infrastructure</span>
+            <span>Components</span>
             <Box className="size-3.5 text-zinc-600" />
           </div>
           <div className="palette-list">
@@ -2379,7 +3062,7 @@ export function CanvasOpsApp() {
                       {catalog.label}
                     </span>
                     <span className="block truncate text-[9px] text-zinc-600">
-                      ${catalog.cost}/mo
+                      {catalog.category} · {catalog.cost === 0 ? "Free" : `$${catalog.cost}/mo`}
                     </span>
                   </span>
                 </button>
@@ -2425,6 +3108,23 @@ export function CanvasOpsApp() {
             Production architecture
             <span className="text-zinc-700">/</span>
             <span className="text-zinc-600">{nodes.length} resources</span>
+            {selectedNodeIds.length > 0 ? (
+              <button
+                className="group-selection-button"
+                onClick={handleGroupSelection}
+                disabled={
+                  planExecution !== null ||
+                  selectedNodeIds.every(
+                    (id) =>
+                      nodes.find((node) => node.id === id)?.data.type ===
+                      "group",
+                  )
+                }
+              >
+                <Layers3 className="size-3" />
+                Group {selectedNodeIds.length}
+              </button>
+            ) : null}
           </div>
 
           {activeOutage ? (
@@ -2793,6 +3493,123 @@ export function CanvasOpsApp() {
               </label>
 
               <label className="config-field">
+                <span>Technology</span>
+                <input
+                  key={`${selectedNode.id}:${selectedNode.data.config.technology}`}
+                  defaultValue={selectedNode.data.config.technology}
+                  maxLength={80}
+                  onBlur={(event) =>
+                    updateSelectedConfig({ technology: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="config-field">
+                <span>Description</span>
+                <textarea
+                  key={`${selectedNode.id}:${selectedNode.data.config.description}`}
+                  rows={3}
+                  defaultValue={selectedNode.data.config.description}
+                  maxLength={500}
+                  onBlur={(event) =>
+                    updateSelectedConfig({ description: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="config-field">
+                <span>Owner / team</span>
+                <input
+                  key={`${selectedNode.id}:${selectedNode.data.config.owner}`}
+                  defaultValue={selectedNode.data.config.owner}
+                  maxLength={80}
+                  onBlur={(event) =>
+                    updateSelectedConfig({ owner: event.target.value })
+                  }
+                />
+              </label>
+
+              <label className="config-field">
+                <span>Environment</span>
+                <select
+                  value={selectedNode.data.config.environment}
+                  onChange={(event) =>
+                    updateSelectedConfig({ environment: event.target.value })
+                  }
+                >
+                  <option value="production">Production</option>
+                  <option value="staging">Staging</option>
+                  <option value="development">Development</option>
+                  <option value="shared">Shared</option>
+                </select>
+              </label>
+
+              {selectedNode.data.type === "group" ? (
+                <div className="group-config-section">
+                  <Button
+                    variant="secondary"
+                    className="w-full"
+                    onClick={() =>
+                      setInfrastructureGroupCollapsed({
+                        group_id: selectedNode.id,
+                        collapsed: !selectedNode.data.collapsed,
+                      })
+                    }
+                  >
+                    <Layers3 className="size-4" />
+                    {selectedNode.data.collapsed ? "Expand group" : "Collapse group"}
+                  </Button>
+                  <div className="group-members-title">
+                    Members
+                    <span>
+                      {nodes.filter((node) => node.parentId === selectedNode.id).length}
+                    </span>
+                  </div>
+                  <div className="group-member-list">
+                    {nodes
+                      .filter(
+                        (node) =>
+                          node.id !== selectedNode.id &&
+                          node.data.type !== "group",
+                      )
+                      .map((node) => {
+                        const checked = node.parentId === selectedNode.id;
+                        return (
+                          <label className="group-member-option" key={node.id}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={(event) => {
+                                const members = new Set(
+                                  nodes
+                                    .filter(
+                                      (candidate) =>
+                                        candidate.parentId === selectedNode.id,
+                                    )
+                                    .map((candidate) => candidate.id),
+                                );
+                                if (event.target.checked) members.add(node.id);
+                                else members.delete(node.id);
+                                setInfrastructureGroupMembers({
+                                  group_id: selectedNode.id,
+                                  node_ids: [...members],
+                                });
+                              }}
+                            />
+                            <code>{nodeReference(node.id)}</code>
+                            <span>{node.data.label}</span>
+                          </label>
+                        );
+                      })}
+                  </div>
+                </div>
+              ) : null}
+
+              {selectedNode.data.type !== "group" &&
+              selectedNode.data.type !== "note" ? (
+                <>
+
+              <label className="config-field">
                 <span>Region</span>
                 <select
                   value={selectedNode.data.config.region}
@@ -2862,6 +3679,70 @@ export function CanvasOpsApp() {
                 />
               </label>
 
+              <label className="config-field">
+                <span>Input ports</span>
+                <input
+                  key={`${selectedNode.id}:${selectedNode.data.config.inputPorts.join(",")}`}
+                  defaultValue={selectedNode.data.config.inputPorts.join(", ")}
+                  placeholder="request, event"
+                  onBlur={(event) =>
+                    updateSelectedConfig({
+                      inputPorts: event.target.value
+                        .split(",")
+                        .map((value) => value.trim())
+                        .filter(Boolean),
+                    })
+                  }
+                />
+              </label>
+
+              <label className="config-field">
+                <span>Output ports</span>
+                <input
+                  key={`${selectedNode.id}:${selectedNode.data.config.outputPorts.join(",")}`}
+                  defaultValue={selectedNode.data.config.outputPorts.join(", ")}
+                  placeholder="response, event"
+                  onBlur={(event) =>
+                    updateSelectedConfig({
+                      outputPorts: event.target.value
+                        .split(",")
+                        .map((value) => value.trim())
+                        .filter(Boolean),
+                    })
+                  }
+                />
+              </label>
+
+              <label className="config-field">
+                <span>Custom properties</span>
+                <textarea
+                  key={`${selectedNode.id}:${JSON.stringify(selectedNode.data.config.customProperties)}`}
+                  rows={4}
+                  defaultValue={Object.entries(
+                    selectedNode.data.config.customProperties,
+                  )
+                    .map(([key, value]) => `${key}=${value}`)
+                    .join("\n")}
+                  placeholder={"KEY=value\nANOTHER=value"}
+                  onBlur={(event) =>
+                    updateSelectedConfig({
+                      customProperties: Object.fromEntries(
+                        event.target.value
+                          .split("\n")
+                          .filter((line) => line.includes("="))
+                          .map((line) => {
+                            const [key, ...rest] = line.split("=");
+                            return [key.trim(), rest.join("=").trim()];
+                          })
+                          .filter(([key]) => key),
+                      ),
+                    })
+                  }
+                />
+              </label>
+                </>
+              ) : null}
+
               <div className="config-summary">
                 <span>Estimated monthly cost</span>
                 <strong>${selectedNode.data.monthlyCost} USDC</strong>
@@ -2876,7 +3757,9 @@ export function CanvasOpsApp() {
                 }}
               >
                 <Trash2 className="size-4" />
-                Remove component
+                {selectedNode.data.type === "group"
+                  ? "Remove group, keep members"
+                  : "Remove component"}
               </Button>
             </div>
           ) : selectedEdge ? (
@@ -2902,7 +3785,7 @@ export function CanvasOpsApp() {
                     updateSelectedEdge({ source: event.target.value })
                   }
                 >
-                  {nodes.map((node) => (
+                  {nodes.filter((node) => isConnectableType(node.data.type)).map((node) => (
                     <option key={node.id} value={node.id}>
                       {nodeReference(node.id)} · {node.data.label}
                     </option>
@@ -2919,7 +3802,7 @@ export function CanvasOpsApp() {
                       updateSelectedEdge({ target: event.target.value })
                     }
                   >
-                    {nodes.map((node) => (
+                    {nodes.filter((node) => isConnectableType(node.data.type)).map((node) => (
                       <option key={node.id} value={node.id}>
                         {nodeReference(node.id)} · {node.data.label}
                       </option>
