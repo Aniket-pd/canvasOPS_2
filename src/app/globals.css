@@ -235,6 +235,18 @@ button {
   background: color-mix(in srgb, var(--node-accent) 7%, transparent);
 }
 
+.node-reference {
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--node-accent) 18%, transparent);
+  border-radius: 4px;
+  padding: 1px 4px;
+  color: color-mix(in srgb, var(--node-accent) 72%, #71717a);
+  background: color-mix(in srgb, var(--node-accent) 5%, transparent);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
 .status-dot {
   width: 5px;
   height: 5px;
@@ -340,6 +352,12 @@ button {
 .react-flow__edge-path {
   stroke: #454a40;
   stroke-width: 1.5;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: #67e8f9;
+  stroke-width: 2.5;
+  filter: drop-shadow(0 0 4px rgba(103, 232, 249, 0.35));
 }
 
 .react-flow__edge.animated path {

@@ -23,6 +23,7 @@ const icons = {
 };
 
 export function InfrastructureNodeCard({
+  id,
   data,
   selected,
 }: NodeProps<InfrastructureNode>) {

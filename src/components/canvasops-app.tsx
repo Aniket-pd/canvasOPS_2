@@ -308,6 +308,14 @@ type PlanExecutionControl = {
   wake: (() => void) | null;
 };
 
+type RoutableEdge = Edge & {
+  pathOptions?: {
+    borderRadius?: number;
+    offset?: number;
+    stepPosition?: number;
+  };
+};
+
 function planOperationToolName(operation: PlanInput["operations"][number]) {
   switch (operation.action) {
     case "add_node":
@@ -476,6 +484,24 @@ export function CanvasOpsApp() {
       edgesRef.current = nextEdges;
       setNodes(nextNodes);
       setEdges(nextEdges);
+      const validNodeIds = new Set(nextNodes.map((node) => node.id));
+      const retainedSelection = selectedNodeIdsRef.current.filter((id) =>
+        validNodeIds.has(id),
+      );
+      if (retainedSelection.length !== selectedNodeIdsRef.current.length) {
+        selectedNodeIdsRef.current = retainedSelection;
+        setSelectedNodeIds(retainedSelection);
+        setSelectedNodeId(
+          retainedSelection.length === 1 ? retainedSelection[0] : null,
+        );
+      }
+      if (
+        selectedEdgeIdRef.current !== null &&
+        !nextEdges.some((edge) => edge.id === selectedEdgeIdRef.current)
+      ) {
+        selectedEdgeIdRef.current = null;
+        setSelectedEdgeId(null);
+      }
     },
     [setEdges, setNodes],
   );
@@ -965,6 +991,8 @@ export function CanvasOpsApp() {
     nextIdRef.current = nextNodeId(resetGraph.nodes);
     setActiveOutage(null);
     setSelectedNodeId(null);
+    setSelectedNodeIds([]);
+    setSelectedEdgeId(null);
     setRightPanel("agent");
     setJudgeMode(true);
     setJudgeStep(0);
@@ -2009,6 +2037,9 @@ export function CanvasOpsApp() {
       const removedIds = new Set(
         changes
           .filter((change) => change.type === "remove")
+          .filter((change) =>
+            nodesRef.current.some((node) => node.id === change.id),
+          )
           .map((change) => change.id),
       );
       if (removedIds.size > 0) {
@@ -2034,7 +2065,11 @@ export function CanvasOpsApp() {
 
   const handleEdgesChange = useCallback(
     (changes: EdgeChange<Edge>[]) => {
-      const removed = changes.filter((change) => change.type === "remove");
+      const removed = changes
+        .filter((change) => change.type === "remove")
+        .filter((change) =>
+          edgesRef.current.some((edge) => edge.id === change.id),
+        );
       if (removed.length > 0) {
         const nextEdges = applyEdgeChanges(changes, edgesRef.current);
         commitGraph(
@@ -2134,8 +2169,25 @@ export function CanvasOpsApp() {
   );
 
   const updateSelectedEdge = useCallback(
-    (patch: Partial<Pick<Edge, "source" | "target" | "label" | "animated">>) => {
+    (
+      patch: Partial<
+        Pick<
+          RoutableEdge,
+          "source" | "target" | "label" | "animated" | "type" | "pathOptions"
+        >
+      >,
+    ) => {
       if (!selectedEdge) return;
+      const source = patch.source ?? selectedEdge.source;
+      const target = patch.target ?? selectedEdge.target;
+      if (source === target) return;
+      const duplicatesAnotherEdge = edgesRef.current.some(
+        (edge) =>
+          edge.id !== selectedEdge.id &&
+          edge.source === source &&
+          edge.target === target,
+      );
+      if (duplicatesAnotherEdge) return;
       const nextEdges = edgesRef.current.map((edge) =>
         edge.id === selectedEdge.id ? { ...edge, ...patch } : edge,
       );
@@ -2439,19 +2491,26 @@ export function CanvasOpsApp() {
             nodeTypes={nodeTypes}
             onInit={setFlow}
             onNodesChange={handleNodesChange}
-            onEdgesChange={onEdgesChange}
+            onEdgesChange={handleEdgesChange}
             onConnect={handleConnect}
+            onReconnect={handleReconnect}
+            onSelectionChange={handleSelectionChange}
             onNodeClick={handleNodeClick}
+            onEdgeClick={handleEdgeClick}
             onNodeDragStart={() => {
               dragStartRef.current = cloneGraph(nodesRef.current, edgesRef.current);
             }}
             onNodeDragStop={(_event, node) => {
               const before = dragStartRef.current;
               if (!before) return;
-              const nextNodes = nodesRef.current.map((item) =>
-                item.id === node.id ? { ...item, position: { ...node.position } } : item,
-              );
-              const after = cloneGraph(nextNodes, edgesRef.current);
+              const after = cloneGraph(nodesRef.current, edgesRef.current);
+              if (
+                JSON.stringify(before.nodes.map((item) => item.position)) ===
+                JSON.stringify(after.nodes.map((item) => item.position))
+              ) {
+                dragStartRef.current = null;
+                return;
+              }
               pushHistory({
                 id: historyIdRef.current++,
                 label: `Moved ${node.data.label}`,
@@ -2461,10 +2520,16 @@ export function CanvasOpsApp() {
               applyGraph(after.nodes, after.edges);
               dragStartRef.current = null;
             }}
-            onPaneClick={() => setSelectedNodeId(null)}
+            onPaneClick={() => {
+              setSelectedNodeId(null);
+              setSelectedNodeIds([]);
+              setSelectedEdgeId(null);
+            }}
             nodesDraggable={planExecution === null}
             nodesConnectable={planExecution === null}
+            edgesReconnectable={planExecution === null}
             elementsSelectable={planExecution === null}
+            multiSelectionKeyCode={["Shift", "Meta", "Control"]}
             fitView
             fitViewOptions={{ padding: 0.23 }}
             minZoom={0.35}
@@ -2524,7 +2589,7 @@ export function CanvasOpsApp() {
             <button
               className={rightPanel === "config" ? "active" : ""}
               onClick={() => setRightPanel("config")}
-              disabled={!selectedNode}
+              disabled={!selectedNode && !selectedEdge}
             >
               <Settings2 className="size-3.5" />
               Configure
@@ -2565,6 +2630,27 @@ export function CanvasOpsApp() {
                     <span>{liveValidation.resilienceScore}</span>
                     <small>resilience</small>
                   </div>
+                </div>
+                <div className="mt-2 flex min-h-7 items-center gap-2 rounded-md border border-white/[.05] bg-black/15 px-2 text-[9px] text-zinc-500">
+                  <MousePointer2 className="size-3 shrink-0 text-zinc-600" />
+                  {selectedNodeIds.length > 0 ? (
+                    <>
+                      <span>Agent scope:</span>
+                      <code className="text-lime-300/80">
+                        {selectedNodeIds.map(nodeReference).join(", ")}
+                      </code>
+                    </>
+                  ) : selectedEdge ? (
+                    <>
+                      <span>Selected route:</span>
+                      <code className="text-cyan-300/80">
+                        {nodeReference(selectedEdge.source)} →{" "}
+                        {nodeReference(selectedEdge.target)}
+                      </code>
+                    </>
+                  ) : (
+                    <span>Select nodes to give the agent an exact scope.</span>
+                  )}
                 </div>
               </div>
 
@@ -2684,12 +2770,27 @@ export function CanvasOpsApp() {
                 </div>
                 <div>
                   <h2>{selectedNode.data.label}</h2>
-                  <code>{selectedNode.id}</code>
+                  <code title={selectedNode.id}>
+                    {nodeReference(selectedNode.id)} · {selectedNode.id}
+                  </code>
                 </div>
                 <button onClick={() => setRightPanel("agent")}>
                   <X className="size-4" />
                 </button>
               </div>
+
+              <label className="config-field">
+                <span>Name</span>
+                <input
+                  key={`${selectedNode.id}:${selectedNode.data.label}`}
+                  defaultValue={selectedNode.data.label}
+                  maxLength={64}
+                  onBlur={(event) => renameSelectedNode(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") event.currentTarget.blur();
+                  }}
+                />
+              </label>
 
               <label className="config-field">
                 <span>Region</span>
@@ -2778,9 +2879,158 @@ export function CanvasOpsApp() {
                 Remove component
               </Button>
             </div>
+          ) : selectedEdge ? (
+            <div className="config-panel">
+              <div className="config-title">
+                <div className="palette-icon text-cyan-300">
+                  <Link2 className="size-4" />
+                </div>
+                <div>
+                  <h2>Connection</h2>
+                  <code>{selectedEdge.id}</code>
+                </div>
+                <button onClick={() => setRightPanel("agent")}>
+                  <X className="size-4" />
+                </button>
+              </div>
+
+              <label className="config-field">
+                <span>Source</span>
+                <select
+                  value={selectedEdge.source}
+                  onChange={(event) =>
+                    updateSelectedEdge({ source: event.target.value })
+                  }
+                >
+                  {nodes.map((node) => (
+                    <option key={node.id} value={node.id}>
+                      {nodeReference(node.id)} · {node.data.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <div className="flex items-end gap-2">
+                <label className="config-field min-w-0 flex-1">
+                  <span>Target</span>
+                  <select
+                    value={selectedEdge.target}
+                    onChange={(event) =>
+                      updateSelectedEdge({ target: event.target.value })
+                    }
+                  >
+                    {nodes.map((node) => (
+                      <option key={node.id} value={node.id}>
+                        {nodeReference(node.id)} · {node.data.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  title="Reverse direction"
+                  onClick={() =>
+                    updateSelectedEdge({
+                      source: selectedEdge.target,
+                      target: selectedEdge.source,
+                    })
+                  }
+                >
+                  <ArrowLeftRight className="size-3.5" />
+                </Button>
+              </div>
+
+              <label className="config-field">
+                <span>Meaning</span>
+                <select
+                  value={String(selectedEdge.label ?? "data")}
+                  onChange={(event) =>
+                    updateSelectedEdge({
+                      label: event.target.value,
+                      animated:
+                        event.target.value === "request" ||
+                        event.target.value === "event",
+                    })
+                  }
+                >
+                  <option value="data">Data flow</option>
+                  <option value="request">Request</option>
+                  <option value="event">Event</option>
+                  <option value="replication">Replication</option>
+                  <option value="dependency">Dependency</option>
+                </select>
+              </label>
+
+              <label className="config-field">
+                <span>Route style</span>
+                <select
+                  value={selectedEdge.type ?? "smoothstep"}
+                  onChange={(event) =>
+                    updateSelectedEdge({ type: event.target.value })
+                  }
+                >
+                  <option value="smoothstep">Rounded orthogonal</option>
+                  <option value="step">Orthogonal</option>
+                  <option value="default">Curved</option>
+                  <option value="straight">Straight</option>
+                </select>
+              </label>
+
+              {selectedEdge.type === "smoothstep" ||
+              selectedEdge.type === "step" ? (
+                <label className="config-field">
+                  <span className="flex items-center justify-between">
+                    Bend position
+                    <code>
+                      {Math.round(
+                        ((selectedEdge as RoutableEdge).pathOptions
+                          ?.stepPosition ?? 0.5) * 100,
+                      )}
+                      %
+                    </code>
+                  </span>
+                  <input
+                    type="range"
+                    min={10}
+                    max={90}
+                    step={5}
+                    value={
+                      ((selectedEdge as RoutableEdge).pathOptions
+                        ?.stepPosition ?? 0.5) * 100
+                    }
+                    onChange={(event) =>
+                      updateSelectedEdge({
+                        pathOptions: {
+                          ...(selectedEdge as RoutableEdge).pathOptions,
+                          stepPosition: Number(event.target.value) / 100,
+                        },
+                      })
+                    }
+                  />
+                </label>
+              ) : null}
+
+              <div className="config-summary">
+                <span>Route</span>
+                <strong>
+                  {nodeReference(selectedEdge.source)} →{" "}
+                  {nodeReference(selectedEdge.target)}
+                </strong>
+              </div>
+
+              <Button
+                variant="danger"
+                className="mt-auto w-full"
+                onClick={removeSelectedEdge}
+              >
+                <Trash2 className="size-4" />
+                Remove connection
+              </Button>
+            </div>
           ) : (
             <div className="grid flex-1 place-items-center px-8 text-center text-sm text-zinc-600">
-              Select a node on the canvas to configure it.
+              Select a node or connection on the canvas to configure it.
             </div>
           )}
         </aside>
