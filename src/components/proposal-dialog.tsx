@@ -92,6 +92,11 @@ export function ProposalDialog({
               : `Plan exceeds the monthly limit by $${(proposal.afterCost - proposal.maxMonthlyCost).toFixed(0)}.`}
         </div>
 
+        <div className="mt-3 rounded-lg border border-cyan-300/10 bg-cyan-300/[.035] px-3 py-2 text-[11px] leading-5 text-cyan-100/70">
+          After approval, CanvasOps applies each operation visibly. You can pause,
+          resume, or cancel and roll back; the completed plan stays one Undo action.
+        </div>
+
         <div className="mt-3 font-mono text-[9px] text-zinc-600">
           Preview {proposal?.architectureHash}
         </div>
@@ -102,7 +107,7 @@ export function ProposalDialog({
             Reject
           </Button>
           <Button className="flex-1" onClick={onApprove} disabled={!budgetOkay}>
-            Approve & apply
+            Approve & watch
           </Button>
         </div>
       </DialogContent>

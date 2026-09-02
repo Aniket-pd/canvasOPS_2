@@ -27,6 +27,13 @@ export type InfrastructureNodeData = {
 
 export type InfrastructureNode = Node<InfrastructureNodeData, "infrastructure">;
 
+export function nodeReference(nodeId: string) {
+  const numericSuffix = nodeId.match(/-(\d+)$/)?.[1];
+  return numericSuffix
+    ? `N${numericSuffix}`
+    : `N-${nodeId.slice(-4).toUpperCase()}`;
+}
+
 export const infrastructureCatalog: Record<
   InfrastructureType,
   { label: string; description: string; cost: number; accent: string }

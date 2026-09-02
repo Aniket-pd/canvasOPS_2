@@ -10,6 +10,7 @@ import {
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import {
   infrastructureCatalog,
+  nodeReference,
   type InfrastructureNode,
 } from "@/lib/infrastructure";
 
@@ -40,8 +41,11 @@ export function InfrastructureNodeCard({
         <Icon className="size-4" strokeWidth={1.9} />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[13px] font-semibold text-zinc-100">
-          {data.label}
+        <div className="flex items-center gap-2">
+          <div className="truncate text-[13px] font-semibold text-zinc-100">
+            {data.label}
+          </div>
+          <code className="node-reference">{nodeReference(id)}</code>
         </div>
         <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-zinc-500">
           <span className="status-dot" />

@@ -4,16 +4,21 @@ import "@mcp-b/global";
 
 import {
   addEdge,
+  applyEdgeChanges,
   applyNodeChanges,
   Background,
   BackgroundVariant,
   Controls,
   MiniMap,
   ReactFlow,
+  reconnectEdge,
   type Connection,
   type Edge,
+  type EdgeChange,
+  type EdgeMouseHandler,
   type NodeChange,
   type NodeMouseHandler,
+  type OnSelectionChangeParams,
   type ReactFlowInstance,
   useEdgesState,
   useNodesState,
@@ -22,6 +27,7 @@ import { useWebMCP } from "@mcp-b/react-webmcp";
 import {
   Activity,
   AlertTriangle,
+  ArrowLeftRight,
   Box,
   Braces,
   Check,
@@ -35,7 +41,10 @@ import {
   HardDrive,
   History,
   Layers3,
+  Link2,
   LayoutDashboard,
+  MonitorPlay,
+  MousePointer2,
   RadioTower,
   RotateCcw,
   ServerCog,
@@ -57,7 +66,15 @@ import {
 } from "react";
 import { z } from "zod";
 import { InfrastructureNodeCard } from "@/components/infrastructure-node";
+import {
+  JudgeModePanel,
+  type JudgeStep,
+} from "@/components/judge-mode-panel";
 import { PaymentDialog } from "@/components/payment-dialog";
+import {
+  PlanExecutionPanel,
+  type PlanExecutionView,
+} from "@/components/plan-execution-panel";
 import {
   type ArchitectureProposal,
   ProposalDialog,
@@ -77,6 +94,7 @@ import {
   initialEdges,
   initialNodes,
   monthlyCostFor,
+  nodeReference,
   type InfrastructureConfig,
   type InfrastructureNode,
   type InfrastructureType,
@@ -97,6 +115,7 @@ const configSchema = z
   .strict();
 
 const analyzeArchitectureSchema = z.object({}).strict();
+const getSelectionContextSchema = z.object({}).strict();
 const addInfrastructureNodeSchema = z
   .object({
     type: z.enum(infrastructureTypes),
@@ -270,6 +289,36 @@ type LegacyModelContext = {
 type PaymentReceipt = Awaited<ReturnType<typeof simulateX402Settlement>>;
 type PlanInput = z.infer<typeof proposeArchitecturePlanSchema>;
 
+type VisualChange = {
+  addedNodeIds: string[];
+  updatedNodeIds: string[];
+  removedNodes: InfrastructureNode[];
+  addedEdgeIds: string[];
+  removedEdges: Edge[];
+};
+
+type PlanStage = {
+  graph: ReturnType<typeof cloneGraph>;
+  label: string;
+};
+
+type PlanExecutionControl = {
+  paused: boolean;
+  cancelled: boolean;
+  wake: (() => void) | null;
+};
+
+function planOperationToolName(operation: PlanInput["operations"][number]) {
+  switch (operation.action) {
+    case "add_node":
+      return "add_infrastructure_node";
+    case "update_node":
+      return "update_node_config";
+    default:
+      return operation.action;
+  }
+}
+
 const paletteIcons: Record<
   InfrastructureType,
   React.ComponentType<{ className?: string }>
@@ -281,14 +330,38 @@ const paletteIcons: Record<
   queue: Workflow,
 };
 
-const browserPrompts = [
-  "Validate this architecture for Mumbai and Singapore, with at least 2 replicas and a $300 monthly budget.",
-  "Propose a safe plan to make this architecture highly available under $300. Ask me to approve before applying it.",
-  "Simulate a Mumbai outage, explain the affected paths, then recover the region. Do not deploy.",
+const judgeSteps: JudgeStep[] = [
+  {
+    title: "Inspect the live graph",
+    goal: "Prove that the agent can read the same architecture the human sees.",
+    prompt:
+      "Validate this architecture for Mumbai and Singapore, with at least 2 replicas and a $300 monthly budget.",
+    expected:
+      "A deterministic resilience score, exact cost, regional coverage, and actionable findings in the activity log.",
+  },
+  {
+    title: "Collaborate on a safe change",
+    goal: "Show an agent planning real canvas mutations while the human stays in control.",
+    prompt:
+      "Propose a safe plan to make this architecture highly available under $300. Ask me to approve before applying it.",
+    expected:
+      "A costed before/after proposal, explicit approval, animated graph changes, and one-step undo.",
+  },
+  {
+    title: "Demonstrate failover",
+    goal: "Make resilience tangible by failing Mumbai and watching traffic survive in Singapore.",
+    prompt:
+      "Simulate a Mumbai outage, explain the affected paths, then recover the region. Do not deploy.",
+    expected:
+      "Failed resources turn red, unavailable paths stop, surviving routes pulse, and recovery restores the graph.",
+  },
 ];
+
+const browserPrompts = judgeSteps.map((step) => step.prompt);
 
 const registeredToolNames = [
   "analyze_current_architecture",
+  "get_selection_context",
   "validate_architecture",
   "propose_architecture_plan",
   "add_infrastructure_node",
@@ -321,20 +394,54 @@ function nextNodeId(nodes: InfrastructureNode[]) {
   );
 }
 
+function resolveNodeId(reference: string, nodes: InfrastructureNode[]) {
+  const normalized = reference.trim().replace(/^@/, "").toLocaleLowerCase();
+  const exactMatches = nodes.filter(
+    (node) =>
+      node.id.toLocaleLowerCase() === normalized ||
+      nodeReference(node.id).toLocaleLowerCase() === normalized,
+  );
+  if (exactMatches.length === 1) return exactMatches[0].id;
+
+  const labelMatches = nodes.filter(
+    (node) => node.data.label.toLocaleLowerCase() === normalized,
+  );
+  if (labelMatches.length === 1) return labelMatches[0].id;
+  if (labelMatches.length > 1) {
+    throw new Error(
+      `“${reference}” is ambiguous. Use ${labelMatches
+        .map((node) => nodeReference(node.id))
+        .join(" or ")}.`,
+    );
+  }
+  throw new Error(`Node reference “${reference}” does not exist.`);
+}
+
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 export function CanvasOpsApp() {
   const [nodes, setNodes, onNodesChange] =
     useNodesState<InfrastructureNode>(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(initialEdges);
+  const [edges, setEdges] = useEdgesState<Edge>(initialEdges);
   const [flow, setFlow] =
     useState<ReactFlowInstance<InfrastructureNode, Edge> | null>(null);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const [rightPanel, setRightPanel] = useState<"agent" | "config">("agent");
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null);
   const [history, setHistory] = useState<GraphHistoryEntry[]>([]);
   const [redoEntries, setRedoEntries] = useState<GraphHistoryEntry[]>([]);
   const [activeOutage, setActiveOutage] = useState<string | null>(null);
+  const [visualChange, setVisualChange] = useState<VisualChange | null>(null);
+  const [judgeMode, setJudgeMode] = useState(false);
+  const [judgeStep, setJudgeStep] = useState(0);
   const [proposal, setProposal] = useState<ArchitectureProposal | null>(null);
+  const [planExecution, setPlanExecution] =
+    useState<PlanExecutionView | null>(null);
   const [paymentOpen, setPaymentOpen] = useState(false);
   const [paymentStatus, setPaymentStatus] = useState<
     "review" | "signing" | "settled"
@@ -348,12 +455,18 @@ export function CanvasOpsApp() {
   const edgesRef = useRef(edges);
   const historyRef = useRef(history);
   const redoRef = useRef(redoEntries);
+  const selectedNodeIdsRef = useRef(selectedNodeIds);
+  const selectedEdgeIdRef = useRef(selectedEdgeId);
   const nextIdRef = useRef(nextNodeId(initialNodes));
   const historyIdRef = useRef(1);
   const toolEventIdRef = useRef(1);
   const hydratedRef = useRef(false);
   const skipInitialSaveRef = useRef(true);
+  const suspendAutosaveRef = useRef(false);
+  const graphMutationLockedRef = useRef(false);
+  const planExecutionControlRef = useRef<PlanExecutionControl | null>(null);
   const dragStartRef = useRef<ReturnType<typeof cloneGraph> | null>(null);
+  const visualChangeTimerRef = useRef<number | null>(null);
   const paymentResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const proposalResolverRef = useRef<((approved: boolean) => void) | null>(null);
 
@@ -375,20 +488,99 @@ export function CanvasOpsApp() {
     setRedoEntries([]);
   }, []);
 
+  const showGraphChanges = useCallback(
+    (
+      before: ReturnType<typeof cloneGraph>,
+      after: ReturnType<typeof cloneGraph>,
+    ) => {
+      const beforeNodes = new Map(before.nodes.map((node) => [node.id, node]));
+      const afterNodes = new Map(after.nodes.map((node) => [node.id, node]));
+      const beforeEdgeIds = new Set(before.edges.map((edge) => edge.id));
+      const afterEdgeIds = new Set(after.edges.map((edge) => edge.id));
+
+      const addedNodeIds = after.nodes
+        .filter((node) => !beforeNodes.has(node.id))
+        .map((node) => node.id);
+      const removedNodes = before.nodes.filter((node) => !afterNodes.has(node.id));
+      const updatedNodeIds = after.nodes
+        .filter((node) => {
+          const previous = beforeNodes.get(node.id);
+          return (
+            previous !== undefined &&
+            JSON.stringify({ data: previous.data, position: previous.position }) !==
+              JSON.stringify({ data: node.data, position: node.position })
+          );
+        })
+        .map((node) => node.id);
+      const addedEdgeIds = after.edges
+        .filter((edge) => !beforeEdgeIds.has(edge.id))
+        .map((edge) => edge.id);
+      const removedEdges = before.edges.filter(
+        (edge) => !afterEdgeIds.has(edge.id),
+      );
+
+      if (
+        addedNodeIds.length === 0 &&
+        removedNodes.length === 0 &&
+        updatedNodeIds.length === 0 &&
+        addedEdgeIds.length === 0 &&
+        removedEdges.length === 0
+      ) {
+        return;
+      }
+
+      setVisualChange({
+        addedNodeIds,
+        updatedNodeIds,
+        removedNodes,
+        addedEdgeIds,
+        removedEdges,
+      });
+      if (visualChangeTimerRef.current !== null) {
+        window.clearTimeout(visualChangeTimerRef.current);
+      }
+      visualChangeTimerRef.current = window.setTimeout(() => {
+        setVisualChange(null);
+        visualChangeTimerRef.current = null;
+      }, 2200);
+    },
+    [],
+  );
+
   const commitGraph = useCallback(
     (label: string, nextNodes: InfrastructureNode[], nextEdges: Edge[]) => {
+      if (graphMutationLockedRef.current) {
+        throw new Error(
+          "An approved architecture plan is currently executing. Pause or cancel it before making another change.",
+        );
+      }
       const before = cloneGraph(nodesRef.current, edgesRef.current);
       const after = cloneGraph(nextNodes, nextEdges);
       pushHistory({ id: historyIdRef.current++, label, before, after });
+      showGraphChanges(before, after);
       applyGraph(after.nodes, after.edges);
     },
-    [applyGraph, pushHistory],
+    [applyGraph, pushHistory, showGraphChanges],
+  );
+
+  useEffect(
+    () => () => {
+      if (visualChangeTimerRef.current !== null) {
+        window.clearTimeout(visualChangeTimerRef.current);
+      }
+    },
+    [],
   );
 
   useEffect(() => {
     nodesRef.current = nodes;
     edgesRef.current = edges;
   }, [edges, nodes]);
+
+  useEffect(() => {
+    selectedNodeIdsRef.current = selectedNodeIds;
+    selectedEdgeIdRef.current = selectedEdgeId;
+  }, [selectedEdgeId, selectedNodeIds]);
 
   useEffect(() => {
     try {
@@ -412,6 +604,7 @@ export function CanvasOpsApp() {
 
   useEffect(() => {
     if (!hydratedRef.current) return;
+    if (suspendAutosaveRef.current) return;
     if (skipInitialSaveRef.current) {
       skipInitialSaveRef.current = false;
       return;
@@ -503,27 +696,17 @@ export function CanvasOpsApp() {
 
   const connectInfrastructureNodes = useCallback(
     (input: z.infer<typeof connectNodesSchema>) => {
-      const sourceExists = nodesRef.current.some(
-        (node) => node.id === input.source_id,
-      );
-      const targetExists = nodesRef.current.some(
-        (node) => node.id === input.target_id,
-      );
-      if (!sourceExists || !targetExists) {
-        throw new Error(
-          `Cannot connect nodes: ${!sourceExists ? input.source_id : input.target_id} does not exist.`,
-        );
-      }
+      const sourceId = resolveNodeId(input.source_id, nodesRef.current);
+      const targetId = resolveNodeId(input.target_id, nodesRef.current);
       const duplicate = edgesRef.current.some(
-        (edge) =>
-          edge.source === input.source_id && edge.target === input.target_id,
+        (edge) => edge.source === sourceId && edge.target === targetId,
       );
       if (duplicate) return { success: true, already_connected: true };
 
       const edge: Edge = {
-        id: `edge-${input.source_id}-${input.target_id}`,
-        source: input.source_id,
-        target: input.target_id,
+        id: `edge-${sourceId}-${targetId}`,
+        source: sourceId,
+        target: targetId,
         type: "smoothstep",
         animated:
           input.connection_type === "event" ||
@@ -531,7 +714,7 @@ export function CanvasOpsApp() {
         label: input.connection_type,
       };
       commitGraph(
-        `Connected ${input.source_id} to ${input.target_id}`,
+        `Connected ${nodeReference(sourceId)} to ${nodeReference(targetId)}`,
         nodesRef.current,
         [...edgesRef.current, edge],
       );
@@ -546,15 +729,17 @@ export function CanvasOpsApp() {
 
   const disconnectInfrastructureNodes = useCallback(
     (input: z.infer<typeof disconnectNodesSchema>) => {
+      const sourceId = resolveNodeId(input.source_id, nodesRef.current);
+      const targetId = resolveNodeId(input.target_id, nodesRef.current);
       const nextEdges = edgesRef.current.filter(
         (edge) =>
-          !(edge.source === input.source_id && edge.target === input.target_id),
+          !(edge.source === sourceId && edge.target === targetId),
       );
       if (nextEdges.length === edgesRef.current.length) {
         throw new Error("The requested connection does not exist.");
       }
       commitGraph(
-        `Disconnected ${input.source_id} from ${input.target_id}`,
+        `Disconnected ${nodeReference(sourceId)} from ${nodeReference(targetId)}`,
         nodesRef.current,
         nextEdges,
       );
@@ -565,18 +750,16 @@ export function CanvasOpsApp() {
 
   const moveInfrastructureNode = useCallback(
     (input: z.infer<typeof moveNodeSchema>) => {
-      if (!nodesRef.current.some((node) => node.id === input.node_id)) {
-        throw new Error(`Node ${input.node_id} does not exist.`);
-      }
+      const nodeId = resolveNodeId(input.node_id, nodesRef.current);
       const nextNodes = nodesRef.current.map((node) =>
-        node.id === input.node_id
+        node.id === nodeId
           ? { ...node, position: { x: input.x, y: input.y } }
           : node,
       );
-      commitGraph(`Moved ${input.node_id}`, nextNodes, edgesRef.current);
+      commitGraph(`Moved ${nodeReference(nodeId)}`, nextNodes, edgesRef.current);
       return {
         success: true,
-        node_id: input.node_id,
+        node_id: nodeId,
         position: { x: input.x, y: input.y },
       };
     },
@@ -585,20 +768,21 @@ export function CanvasOpsApp() {
 
   const removeInfrastructureNode = useCallback(
     (input: z.infer<typeof removeNodeSchema>) => {
-      const target = nodesRef.current.find((node) => node.id === input.node_id);
-      if (!target) throw new Error(`Node ${input.node_id} does not exist.`);
+      const nodeId = resolveNodeId(input.node_id, nodesRef.current);
+      const target = nodesRef.current.find((node) => node.id === nodeId);
+      if (!target) throw new Error(`Node ${nodeId} does not exist.`);
       const nextNodes = nodesRef.current.filter(
-        (node) => node.id !== input.node_id,
+        (node) => node.id !== nodeId,
       );
       const nextEdges = edgesRef.current.filter(
         (edge) =>
-          edge.source !== input.node_id && edge.target !== input.node_id,
+          edge.source !== nodeId && edge.target !== nodeId,
       );
       const removedEdges = edgesRef.current.length - nextEdges.length;
       commitGraph(`Removed ${target.data.label}`, nextNodes, nextEdges);
       return {
         success: true,
-        removed_node_id: input.node_id,
+        removed_node_id: nodeId,
         removed_edges: removedEdges,
         monthly_savings_usdc: target.data.monthlyCost,
       };
@@ -608,10 +792,11 @@ export function CanvasOpsApp() {
 
   const updateInfrastructureNode = useCallback(
     (input: z.infer<typeof updateNodeConfigSchema>) => {
-      const target = nodesRef.current.find((node) => node.id === input.node_id);
-      if (!target) throw new Error(`Node ${input.node_id} does not exist.`);
+      const nodeId = resolveNodeId(input.node_id, nodesRef.current);
+      const target = nodesRef.current.find((node) => node.id === nodeId);
+      if (!target) throw new Error(`Node ${nodeId} does not exist.`);
       const nextNodes = nodesRef.current.map((node) => {
-        if (node.id !== input.node_id) return node;
+        if (node.id !== nodeId) return node;
         const replicas = input.replicas ?? node.data.config.replicas;
         return {
           ...node,
@@ -634,10 +819,10 @@ export function CanvasOpsApp() {
       commitGraph(`Updated ${target.data.label}`, nextNodes, edgesRef.current);
       return {
         success: true,
-        node_id: input.node_id,
+        node_id: nodeId,
         updated_fields: Object.keys(input).filter((key) => key !== "node_id"),
         monthly_cost_usdc:
-          nextNodes.find((node) => node.id === input.node_id)?.data.monthlyCost ??
+          nextNodes.find((node) => node.id === nodeId)?.data.monthlyCost ??
           0,
       };
     },
@@ -658,6 +843,7 @@ export function CanvasOpsApp() {
       disconnected_node_ids: validation.disconnectedNodeIds,
       nodes: nodesRef.current.map((node) => ({
         id: node.id,
+        reference: nodeReference(node.id),
         type: node.data.type,
         label: node.data.label,
         position: node.position,
@@ -671,10 +857,55 @@ export function CanvasOpsApp() {
         target_id: edge.target,
         connection_type: edge.label ?? "data",
       })),
+      selection: {
+        node_ids: selectedNodeIdsRef.current,
+        node_references: selectedNodeIdsRef.current.map(nodeReference),
+        edge_id: selectedEdgeIdRef.current,
+      },
+    };
+  }, []);
+
+  const getSelectionContext = useCallback(() => {
+    const selectedIds = new Set(selectedNodeIdsRef.current);
+    const selectedNodes = nodesRef.current.filter((node) =>
+      selectedIds.has(node.id),
+    );
+    const selectedEdges = edgesRef.current.filter(
+      (edge) =>
+        edge.id === selectedEdgeIdRef.current ||
+        selectedIds.has(edge.source) ||
+        selectedIds.has(edge.target),
+    );
+    return {
+      selected_node_count: selectedNodes.length,
+      selected_edge_id: selectedEdgeIdRef.current,
+      nodes: selectedNodes.map((node) => ({
+        id: node.id,
+        reference: nodeReference(node.id),
+        label: node.data.label,
+        type: node.data.type,
+        position: node.position,
+        config: node.data.config,
+      })),
+      related_connections: selectedEdges.map((edge) => ({
+        id: edge.id,
+        source_id: edge.source,
+        source_reference: nodeReference(edge.source),
+        target_id: edge.target,
+        target_reference: nodeReference(edge.target),
+        connection_type: edge.label ?? "data",
+      })),
+      instruction:
+        selectedNodes.length === 0 && selectedEdgeIdRef.current === null
+          ? "Nothing is selected. Ask the user to select an element or use an exact node reference."
+          : "Treat selected elements as the explicit scope. Preserve all unselected elements unless the user clearly requests otherwise.",
     };
   }, []);
 
   const undoLastChange = useCallback(() => {
+    if (graphMutationLockedRef.current) {
+      return { success: false, status: "plan_execution_in_progress" };
+    }
     const latest = historyRef.current.at(-1);
     if (!latest) return { success: false, status: "nothing_to_undo" };
     const nextHistory = historyRef.current.slice(0, -1);
@@ -683,11 +914,15 @@ export function CanvasOpsApp() {
     const nextRedo = [...redoRef.current, latest].slice(-30);
     redoRef.current = nextRedo;
     setRedoEntries(nextRedo);
+    showGraphChanges(latest.after, latest.before);
     applyGraph(latest.before.nodes, latest.before.edges);
     return { success: true, reverted: latest.label };
-  }, [applyGraph]);
+  }, [applyGraph, showGraphChanges]);
 
   const redoLastChange = useCallback(() => {
+    if (graphMutationLockedRef.current) {
+      return { success: false, status: "plan_execution_in_progress" };
+    }
     const latest = redoRef.current.at(-1);
     if (!latest) return { success: false, status: "nothing_to_redo" };
     const nextRedo = redoRef.current.slice(0, -1);
@@ -696,9 +931,10 @@ export function CanvasOpsApp() {
     const nextHistory = [...historyRef.current, latest].slice(-30);
     historyRef.current = nextHistory;
     setHistory(nextHistory);
+    showGraphChanges(latest.before, latest.after);
     applyGraph(latest.after.nodes, latest.after.edges);
     return { success: true, replayed: latest.label };
-  }, [applyGraph]);
+  }, [applyGraph, showGraphChanges]);
 
   const runAutoLayout = useCallback(
     (input: z.infer<typeof autoLayoutSchema>) => {
@@ -723,6 +959,27 @@ export function CanvasOpsApp() {
     [commitGraph, flow],
   );
 
+  const resetDemo = useCallback(() => {
+    const resetGraph = cloneGraph(initialNodes, initialEdges);
+    commitGraph("Reset to the judge demo architecture", resetGraph.nodes, resetGraph.edges);
+    nextIdRef.current = nextNodeId(resetGraph.nodes);
+    setActiveOutage(null);
+    setSelectedNodeId(null);
+    setRightPanel("agent");
+    setJudgeMode(true);
+    setJudgeStep(0);
+    setToolEvents([]);
+    logToolEvent(
+      "demo_reset",
+      "Restored the deterministic judge demo. The previous graph remains available through Undo.",
+      {},
+    );
+    window.setTimeout(
+      () => void flow?.fitView({ padding: 0.23, duration: 650 }),
+      60,
+    );
+  }, [commitGraph, flow, logToolEvent]);
+
   const simulateOutage = useCallback(
     (input: z.infer<typeof simulateOutageSchema>) => {
       const recovering = input.mode === "recover";
@@ -733,6 +990,15 @@ export function CanvasOpsApp() {
         throw new Error(`No resources are deployed in ${input.region}.`);
       }
       const affectedSet = new Set(affectedIds);
+      const failoverNodeIds = nodesRef.current
+        .filter(
+          (node) =>
+            node.data.type === "api-service" &&
+            node.data.config.region !== input.region &&
+            node.data.status !== "warning",
+        )
+        .map((node) => node.id);
+      const failoverSet = new Set(failoverNodeIds);
       const nextNodes = nodesRef.current.map((node) => ({
         ...node,
         data: {
@@ -747,18 +1013,15 @@ export function CanvasOpsApp() {
       const nextEdges = edgesRef.current.map((edge) => {
         const affected =
           affectedSet.has(edge.source) || affectedSet.has(edge.target);
+        const carriesFailoverTraffic =
+          failoverSet.has(edge.source) || failoverSet.has(edge.target);
         return {
           ...edge,
           animated: recovering
             ? edge.label === "request" || edge.label === "event"
             : affected
               ? false
-              : edge.animated,
-          style: recovering
-            ? undefined
-            : affected
-              ? { stroke: "#f87171", strokeWidth: 2 }
-              : edge.style,
+              : carriesFailoverTraffic || edge.animated,
         };
       });
       commitGraph(
@@ -775,6 +1038,8 @@ export function CanvasOpsApp() {
         affected_connection_count: edgesRef.current.filter(
           (edge) => affectedSet.has(edge.source) || affectedSet.has(edge.target),
         ).length,
+        failover_node_ids: recovering ? [] : failoverNodeIds,
+        traffic_rerouted: !recovering && failoverNodeIds.length > 0,
       };
     },
     [commitGraph],
@@ -788,7 +1053,9 @@ export function CanvasOpsApp() {
       let simulatedId = nextIdRef.current;
       const aliases = new Map<string, string>();
       const changes: string[] = [];
-      const resolveRef = (reference: string) => aliases.get(reference) ?? reference;
+      const stages: PlanStage[] = [];
+      const resolveRef = (reference: string) =>
+        aliases.get(reference) ?? resolveNodeId(reference, simulatedNodes);
 
       for (const operation of input.operations) {
         if (operation.action === "add_node") {
@@ -809,28 +1076,23 @@ export function CanvasOpsApp() {
           simulatedNodes = [...simulatedNodes, node];
           changes.push(`Add ${node.data.label} in ${node.data.config.region}`);
         } else if (operation.action === "move_node") {
-          if (!simulatedNodes.some((node) => node.id === operation.node_id)) {
-            throw new Error(`Node ${operation.node_id} does not exist.`);
-          }
+          const nodeId = resolveRef(operation.node_id);
           simulatedNodes = simulatedNodes.map((node) =>
-            node.id === operation.node_id
+            node.id === nodeId
               ? { ...node, position: { x: operation.x, y: operation.y } }
               : node,
           );
-          changes.push(`Move ${operation.node_id} to a clear position`);
+          changes.push(`Move ${nodeReference(nodeId)} to a clear position`);
         } else if (operation.action === "remove_node") {
-          if (!simulatedNodes.some((node) => node.id === operation.node_id)) {
-            throw new Error(`Node ${operation.node_id} does not exist.`);
-          }
+          const nodeId = resolveRef(operation.node_id);
           simulatedNodes = simulatedNodes.filter(
-            (node) => node.id !== operation.node_id,
+            (node) => node.id !== nodeId,
           );
           simulatedEdges = simulatedEdges.filter(
             (edge) =>
-              edge.source !== operation.node_id &&
-              edge.target !== operation.node_id,
+              edge.source !== nodeId && edge.target !== nodeId,
           );
-          changes.push(`Remove ${operation.node_id} and its dependencies`);
+          changes.push(`Remove ${nodeReference(nodeId)} and its dependencies`);
         } else if (operation.action === "connect_nodes") {
           const source = resolveRef(operation.source_ref);
           const target = resolveRef(operation.target_ref);
@@ -861,21 +1123,25 @@ export function CanvasOpsApp() {
           }
           changes.push(`Connect ${source} → ${target} as ${operation.connection_type}`);
         } else if (operation.action === "disconnect_nodes") {
+          const sourceId = resolveRef(operation.source_id);
+          const targetId = resolveRef(operation.target_id);
           simulatedEdges = simulatedEdges.filter(
             (edge) =>
               !(
-                edge.source === operation.source_id &&
-                edge.target === operation.target_id
+                edge.source === sourceId && edge.target === targetId
               ),
           );
-          changes.push(`Disconnect ${operation.source_id} → ${operation.target_id}`);
-        } else {
-          const target = simulatedNodes.find(
-            (node) => node.id === operation.node_id,
+          changes.push(
+            `Disconnect ${nodeReference(sourceId)} → ${nodeReference(targetId)}`,
           );
-          if (!target) throw new Error(`Node ${operation.node_id} does not exist.`);
+        } else {
+          const nodeId = resolveRef(operation.node_id);
+          const target = simulatedNodes.find(
+            (node) => node.id === nodeId,
+          );
+          if (!target) throw new Error(`Node ${nodeId} does not exist.`);
           simulatedNodes = simulatedNodes.map((node) => {
-            if (node.id !== operation.node_id) return node;
+            if (node.id !== nodeId) return node;
             const replicas =
               operation.config.replicas ?? node.data.config.replicas;
             return {
@@ -899,14 +1165,19 @@ export function CanvasOpsApp() {
               },
             };
           });
-          changes.push(`Update ${operation.node_id} configuration`);
+          changes.push(`Update ${nodeReference(nodeId)} configuration`);
         }
+        stages.push({
+          graph: cloneGraph(simulatedNodes, simulatedEdges),
+          label: changes.at(-1) ?? "Apply architecture change",
+        });
       }
       return {
         nextNodes: simulatedNodes,
         nextEdges: simulatedEdges,
         nextId: simulatedId,
         changes,
+        stages,
       };
     },
     [createNode],
@@ -985,21 +1256,185 @@ export function CanvasOpsApp() {
     [requestPaymentConfirmation],
   );
 
+  const executePlanStages = useCallback(
+    async (
+      parsed: PlanInput,
+      preview: ReturnType<typeof previewPlan>,
+      beforeCost: number,
+      afterCost: number,
+      finalHash: string,
+    ) => {
+      const before = cloneGraph(nodesRef.current, edgesRef.current);
+      let appliedSteps = 0;
+      const control: PlanExecutionControl = {
+        paused: false,
+        cancelled: false,
+        wake: null,
+      };
+      const reducedMotion = window.matchMedia(
+        "(prefers-reduced-motion: reduce)",
+      ).matches;
+      const stepDelay = reducedMotion ? 120 : 1100;
+      const persist = (graph: ReturnType<typeof cloneGraph>) => {
+        window.localStorage.setItem(
+          STORAGE_KEY,
+          JSON.stringify({ nodes: graph.nodes, edges: graph.edges }),
+        );
+      };
+      const waitWhilePaused = async () => {
+        while (control.paused && !control.cancelled) {
+          await new Promise<void>((resolve) => {
+            control.wake = resolve;
+          });
+        }
+        control.wake = null;
+      };
+      const rollback = async (label: string) => {
+        setPlanExecution((current) =>
+          current
+            ? {
+                ...current,
+                status: "rolling-back",
+                currentLabel: label,
+              }
+            : current,
+        );
+        const current = cloneGraph(nodesRef.current, edgesRef.current);
+        showGraphChanges(current, before);
+        applyGraph(before.nodes, before.edges);
+        persist(before);
+        logToolEvent(
+          "plan_rollback",
+          `Restored the original graph after ${appliedSteps} completed step(s).`,
+          {
+            plan: parsed.summary,
+            completed_steps: appliedSteps,
+            restored_architecture_hash: architectureHash(
+              before.nodes,
+              before.edges,
+            ),
+          },
+          "cancelled",
+        );
+        await wait(reducedMotion ? 100 : 700);
+      };
+
+      graphMutationLockedRef.current = true;
+      suspendAutosaveRef.current = true;
+      planExecutionControlRef.current = control;
+      setPlanExecution({
+        summary: parsed.summary,
+        steps: preview.changes,
+        currentStep: 0,
+        currentLabel: "Preparing the approved transaction",
+        status: "running",
+        beforeCost,
+        targetCost: afterCost,
+      });
+
+      try {
+        for (let index = 0; index < preview.stages.length; index += 1) {
+          await waitWhilePaused();
+          if (control.cancelled) {
+            await rollback("Restoring the architecture from before this plan");
+            return {
+              success: false as const,
+              status: "cancelled_and_rolled_back" as const,
+              changes_applied: index,
+            };
+          }
+
+          const stage = preview.stages[index];
+          const operation = parsed.operations[index];
+          const previous = cloneGraph(nodesRef.current, edgesRef.current);
+          showGraphChanges(previous, stage.graph);
+          applyGraph(stage.graph.nodes, stage.graph.edges);
+          appliedSteps = index + 1;
+          logToolEvent(
+            planOperationToolName(operation),
+            `Plan step ${index + 1}/${preview.stages.length}: ${stage.label}.`,
+            operation,
+          );
+          setPlanExecution((current) =>
+            current
+              ? {
+                  ...current,
+                  currentStep: index + 1,
+                  currentLabel: stage.label,
+                }
+              : current,
+          );
+          await wait(stepDelay);
+        }
+
+        await waitWhilePaused();
+        if (control.cancelled) {
+          await rollback("Restoring the architecture from before this plan");
+          return {
+            success: false as const,
+            status: "cancelled_and_rolled_back" as const,
+            changes_applied: preview.stages.length,
+          };
+        }
+
+        const after = cloneGraph(preview.nextNodes, preview.nextEdges);
+        pushHistory({
+          id: historyIdRef.current++,
+          label: parsed.summary,
+          before,
+          after,
+        });
+        nextIdRef.current = preview.nextId;
+        persist(after);
+        setPlanExecution((current) =>
+          current
+            ? {
+                ...current,
+                currentStep: preview.stages.length,
+                currentLabel: "All changes applied as one undoable transaction",
+                status: "completed",
+              }
+            : current,
+        );
+        await wait(reducedMotion ? 120 : 900);
+        return {
+          success: true as const,
+          status: "applied" as const,
+          changes_applied: preview.changes.length,
+          estimated_monthly_cost_usdc: afterCost,
+          architecture_hash: finalHash,
+        };
+      } catch (error) {
+        await rollback("An operation failed; restoring the original graph");
+        return {
+          success: false as const,
+          status: "failed_and_rolled_back" as const,
+          error: error instanceof Error ? error.message : "Unknown execution error",
+        };
+      } finally {
+        graphMutationLockedRef.current = false;
+        suspendAutosaveRef.current = false;
+        planExecutionControlRef.current = null;
+        setPlanExecution(null);
+      }
+    },
+    [applyGraph, logToolEvent, pushHistory, showGraphChanges],
+  );
+
   const proposeArchitecturePlan = useCallback(
     async (parsed: PlanInput) => {
       const preview = previewPlan(parsed);
       const beforeCost = calculateMonthlyTotal(nodesRef.current);
       const afterCost = calculateMonthlyTotal(preview.nextNodes);
+      const beforeHash = architectureHash(nodesRef.current, edgesRef.current);
+      const finalHash = architectureHash(preview.nextNodes, preview.nextEdges);
       const nextProposal: ArchitectureProposal = {
         summary: parsed.summary,
         changes: preview.changes,
         beforeCost,
         afterCost,
         maxMonthlyCost: parsed.max_monthly_cost_usdc,
-        architectureHash: architectureHash(
-          preview.nextNodes,
-          preview.nextEdges,
-        ),
+        architectureHash: finalHash,
       };
       logToolEvent(
         "propose_architecture_plan",
@@ -1017,23 +1452,37 @@ export function CanvasOpsApp() {
         );
         return { success: false, status: "rejected_by_user" };
       }
-      commitGraph(parsed.summary, preview.nextNodes, preview.nextEdges);
-      nextIdRef.current = preview.nextId;
+      if (architectureHash(nodesRef.current, edgesRef.current) !== beforeHash) {
+        logToolEvent(
+          "propose_architecture_plan",
+          "The graph changed during review, so the stale plan was not applied.",
+          parsed,
+          "cancelled",
+        );
+        return { success: false, status: "stale_plan" };
+      }
+
+      const result = await executePlanStages(
+        parsed,
+        preview,
+        beforeCost,
+        afterCost,
+        finalHash,
+      );
       logToolEvent(
         "propose_architecture_plan",
-        `Human approved and applied ${preview.changes.length} changes as one undoable transaction.`,
+        result.success
+          ? `Human approved and watched ${preview.changes.length} changes apply as one undoable transaction.`
+          : result.status === "cancelled_and_rolled_back"
+            ? `Human cancelled after ${result.changes_applied} step(s); the original graph was restored.`
+            : "Plan execution failed; the original graph was restored.",
         parsed,
+        result.success ? "success" : "cancelled",
       );
-      return {
-        success: true,
-        status: "applied",
-        changes_applied: preview.changes.length,
-        estimated_monthly_cost_usdc: afterCost,
-        architecture_hash: nextProposal.architectureHash,
-      };
+      return result;
     },
     [
-      commitGraph,
+      executePlanStages,
       logToolEvent,
       previewPlan,
       requestProposalConfirmation,
@@ -1059,6 +1508,27 @@ export function CanvasOpsApp() {
       },
     },
     [analyzeArchitecture, logToolEvent],
+  );
+
+  useWebMCP(
+    {
+      name: "get_selection_context",
+      description:
+        "Read the user's current node and connection selection. Call when the user says this, selected, these nodes, or refers to the current focus.",
+      inputSchema: getSelectionContextSchema,
+      annotations: { readOnlyHint: true },
+      execute: (input) => {
+        const parsed = getSelectionContextSchema.parse(input);
+        const result = getSelectionContext();
+        logToolEvent(
+          "get_selection_context",
+          `Read ${result.selected_node_count} selected node(s)${result.selected_edge_id ? " and one selected connection" : ""}.`,
+          parsed,
+        );
+        return result;
+      },
+    },
+    [getSelectionContext, logToolEvent],
   );
 
   useWebMCP(
@@ -1124,7 +1594,8 @@ export function CanvasOpsApp() {
   useWebMCP(
     {
       name: "move_node",
-      description: "Move one existing node to exact canvas coordinates.",
+      description:
+        "Move one existing node to exact canvas coordinates. node_id accepts a permanent ID, short reference such as N4, or an unambiguous label.",
       inputSchema: moveNodeSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1145,7 +1616,7 @@ export function CanvasOpsApp() {
     {
       name: "remove_node",
       description:
-        "Remove one existing node and all attached edges. This mutation is undoable.",
+        "Remove one existing node and all attached edges. node_id accepts an ID, short reference, or unambiguous label. This mutation is undoable.",
       inputSchema: removeNodeSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1166,7 +1637,7 @@ export function CanvasOpsApp() {
     {
       name: "connect_nodes",
       description:
-        "Create a validated directional connection between two exact node IDs.",
+        "Create a validated directional connection. Each endpoint accepts a permanent ID, short reference such as N4, or an unambiguous label.",
       inputSchema: connectNodesSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1188,7 +1659,8 @@ export function CanvasOpsApp() {
   useWebMCP(
     {
       name: "disconnect_nodes",
-      description: "Remove one exact directional connection between two nodes.",
+      description:
+        "Remove one directional connection. Each endpoint accepts a permanent ID, short reference, or unambiguous label.",
       inputSchema: disconnectNodesSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1209,7 +1681,7 @@ export function CanvasOpsApp() {
     {
       name: "update_node_config",
       description:
-        "Update a node label, region, instance size, replicas, and/or environment variables. Cost is recalculated from replicas.",
+        "Update a node label, region, instance size, replicas, and/or environment variables. node_id accepts an ID, short reference, or unambiguous label. Cost is recalculated from replicas.",
       inputSchema: updateNodeConfigSchema,
       annotations: { readOnlyHint: false },
       execute: (input) => {
@@ -1365,7 +1837,11 @@ export function CanvasOpsApp() {
         },
       },
       { signal: controller.signal },
-    );
+    ).catch((error: unknown) => {
+      if (!controller.signal.aborted) {
+        console.error("Failed to register provision_and_pay", error);
+      }
+    });
 
     return () => controller.abort();
   }, [
@@ -1388,6 +1864,102 @@ export function CanvasOpsApp() {
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
     [nodes, selectedNodeId],
   );
+  const selectedEdge = useMemo(
+    () => edges.find((edge) => edge.id === selectedEdgeId) ?? null,
+    [edges, selectedEdgeId],
+  );
+  const outageImpact = useMemo(() => {
+    if (!activeOutage) return null;
+    const affectedNodeIds = new Set(
+      nodes
+        .filter((node) => node.data.config.region === activeOutage)
+        .map((node) => node.id),
+    );
+    const failedEdgeIds = new Set(
+      edges
+        .filter(
+          (edge) =>
+            affectedNodeIds.has(edge.source) || affectedNodeIds.has(edge.target),
+        )
+        .map((edge) => edge.id),
+    );
+    const failoverNodes = nodes.filter(
+      (node) =>
+        node.data.type === "api-service" &&
+        node.data.config.region !== activeOutage &&
+        !affectedNodeIds.has(node.id),
+    );
+    const failoverNodeIds = new Set(failoverNodes.map((node) => node.id));
+    const reroutedEdgeIds = new Set(
+      edges
+        .filter(
+          (edge) =>
+            !failedEdgeIds.has(edge.id) &&
+            (failoverNodeIds.has(edge.source) || failoverNodeIds.has(edge.target)),
+        )
+        .map((edge) => edge.id),
+    );
+    const regions = [...new Set(failoverNodes.map((node) => node.data.config.region))];
+    return {
+      affectedNodeIds,
+      failedEdgeIds,
+      reroutedEdgeIds,
+      affectedCount: affectedNodeIds.size,
+      failedPathCount: failedEdgeIds.size,
+      failoverRegions: regions,
+      failoverCount: failoverNodes.length,
+    };
+  }, [activeOutage, edges, nodes]);
+  const displayNodes = useMemo(() => {
+    const added = new Set(visualChange?.addedNodeIds ?? []);
+    const updated = new Set(visualChange?.updatedNodeIds ?? []);
+    const current = nodes.map((node) => ({
+      ...node,
+      className: [
+        node.className,
+        added.has(node.id) ? "node-change-added" : "",
+        updated.has(node.id) ? "node-change-updated" : "",
+        outageImpact?.affectedNodeIds.has(node.id) ? "node-outage-failed" : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+    }));
+    const removed = (visualChange?.removedNodes ?? []).map((node) => ({
+      ...node,
+      draggable: false,
+      selectable: false,
+      className: [node.className, "node-change-removed"].filter(Boolean).join(" "),
+    }));
+    return [...current, ...removed];
+  }, [nodes, outageImpact, visualChange]);
+  const displayEdges = useMemo(() => {
+    const added = new Set(visualChange?.addedEdgeIds ?? []);
+    const current = edges.map((edge) => ({
+      ...edge,
+      className: [
+        edge.className,
+        added.has(edge.id) ? "edge-change-added" : "",
+        outageImpact?.failedEdgeIds.has(edge.id) ? "edge-outage-failed" : "",
+        outageImpact?.reroutedEdgeIds.has(edge.id) ? "edge-outage-rerouted" : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+    }));
+    const displayNodeIds = new Set(displayNodes.map((node) => node.id));
+    const removed = (visualChange?.removedEdges ?? [])
+      .filter(
+        (edge) =>
+          displayNodeIds.has(edge.source) && displayNodeIds.has(edge.target),
+      )
+      .map((edge) => ({
+        ...edge,
+        animated: false,
+        className: [edge.className, "edge-change-removed"]
+          .filter(Boolean)
+          .join(" "),
+      }));
+    return [...current, ...removed];
+  }, [displayNodes, edges, outageImpact, visualChange]);
 
   const handleConnect = useCallback(
     (connection: Connection) => {
@@ -1410,21 +1982,105 @@ export function CanvasOpsApp() {
     [commitGraph],
   );
 
+  const handleReconnect = useCallback(
+    (oldEdge: Edge, connection: Connection) => {
+      if (!connection.source || !connection.target) return;
+      const duplicate = edgesRef.current.some(
+        (edge) =>
+          edge.id !== oldEdge.id &&
+          edge.source === connection.source &&
+          edge.target === connection.target,
+      );
+      if (duplicate) return;
+      const nextEdges = reconnectEdge(oldEdge, connection, edgesRef.current, {
+        shouldReplaceId: false,
+      });
+      commitGraph(
+        `Rerouted ${nodeReference(connection.source)} → ${nodeReference(connection.target)}`,
+        nodesRef.current,
+        nextEdges,
+      );
+    },
+    [commitGraph],
+  );
+
   const handleNodesChange = useCallback(
     (changes: NodeChange<InfrastructureNode>[]) => {
+      const removedIds = new Set(
+        changes
+          .filter((change) => change.type === "remove")
+          .map((change) => change.id),
+      );
+      if (removedIds.size > 0) {
+        const nextNodes = applyNodeChanges(changes, nodesRef.current);
+        const nextEdges = edgesRef.current.filter(
+          (edge) =>
+            !removedIds.has(edge.source) && !removedIds.has(edge.target),
+        );
+        commitGraph(
+          `Removed ${removedIds.size} selected component${removedIds.size === 1 ? "" : "s"}`,
+          nextNodes,
+          nextEdges,
+        );
+        setSelectedNodeId(null);
+        setSelectedNodeIds([]);
+        return;
+      }
       onNodesChange(changes);
       nodesRef.current = applyNodeChanges(changes, nodesRef.current);
     },
-    [onNodesChange],
+    [commitGraph, onNodesChange],
+  );
+
+  const handleEdgesChange = useCallback(
+    (changes: EdgeChange<Edge>[]) => {
+      const removed = changes.filter((change) => change.type === "remove");
+      if (removed.length > 0) {
+        const nextEdges = applyEdgeChanges(changes, edgesRef.current);
+        commitGraph(
+          `Removed ${removed.length} selected connection${removed.length === 1 ? "" : "s"}`,
+          nodesRef.current,
+          nextEdges,
+        );
+        setSelectedEdgeId(null);
+        return;
+      }
+      const nextEdges = applyEdgeChanges(changes, edgesRef.current);
+      edgesRef.current = nextEdges;
+      setEdges(nextEdges);
+    },
+    [commitGraph, setEdges],
+  );
+
+  const handleSelectionChange = useCallback(
+    ({ nodes: selectedNodes, edges: selectedEdges }: OnSelectionChangeParams<
+      InfrastructureNode,
+      Edge
+    >) => {
+      const nodeIds = selectedNodes.map((node) => node.id);
+      const edgeId = selectedEdges.length === 1 ? selectedEdges[0].id : null;
+      setSelectedNodeIds(nodeIds);
+      setSelectedNodeId(nodeIds.length === 1 ? nodeIds[0] : null);
+      setSelectedEdgeId(edgeId);
+      if (nodeIds.length === 1 || edgeId !== null) setRightPanel("config");
+    },
+    [],
   );
 
   const handleNodeClick: NodeMouseHandler<InfrastructureNode> = useCallback(
     (_event, node) => {
       setSelectedNodeId(node.id);
+      setSelectedEdgeId(null);
       setRightPanel("config");
     },
     [],
   );
+
+  const handleEdgeClick: EdgeMouseHandler<Edge> = useCallback((_event, edge) => {
+    setSelectedEdgeId(edge.id);
+    setSelectedNodeId(null);
+    setRightPanel("config");
+  }, []);
 
   const handleDrop = useCallback(
     (event: DragEvent<HTMLDivElement>) => {
@@ -1444,6 +2100,7 @@ export function CanvasOpsApp() {
 
   const updateSelectedConfig = useCallback(
     (patch: Partial<InfrastructureConfig>) => {
+      if (graphMutationLockedRef.current) return;
       if (!selectedNodeId) return;
       const target = nodesRef.current.find((node) => node.id === selectedNodeId);
       if (!target) return;
@@ -1465,6 +2122,39 @@ export function CanvasOpsApp() {
     [commitGraph, selectedNodeId],
   );
 
+  const renameSelectedNode = useCallback(
+    (label: string) => {
+      if (!selectedNode || label.trim() === selectedNode.data.label) return;
+      updateInfrastructureNode({
+        node_id: selectedNode.id,
+        label: label.trim(),
+      });
+    },
+    [selectedNode, updateInfrastructureNode],
+  );
+
+  const updateSelectedEdge = useCallback(
+    (patch: Partial<Pick<Edge, "source" | "target" | "label" | "animated">>) => {
+      if (!selectedEdge) return;
+      const nextEdges = edgesRef.current.map((edge) =>
+        edge.id === selectedEdge.id ? { ...edge, ...patch } : edge,
+      );
+      commitGraph("Updated connection", nodesRef.current, nextEdges);
+    },
+    [commitGraph, selectedEdge],
+  );
+
+  const removeSelectedEdge = useCallback(() => {
+    if (!selectedEdge) return;
+    commitGraph(
+      `Removed ${nodeReference(selectedEdge.source)} → ${nodeReference(selectedEdge.target)}`,
+      nodesRef.current,
+      edgesRef.current.filter((edge) => edge.id !== selectedEdge.id),
+    );
+    setSelectedEdgeId(null);
+    setRightPanel("agent");
+  }, [commitGraph, selectedEdge]);
+
   const handlePaymentConfirm = () => {
     paymentResolverRef.current?.(true);
     paymentResolverRef.current = null;
@@ -1483,6 +2173,32 @@ export function CanvasOpsApp() {
     proposalResolverRef.current?.(false);
     proposalResolverRef.current = null;
     setProposal(null);
+  };
+  const handlePlanPause = () => {
+    const control = planExecutionControlRef.current;
+    if (!control || control.cancelled) return;
+    control.paused = true;
+    setPlanExecution((current) =>
+      current ? { ...current, status: "paused" } : current,
+    );
+  };
+  const handlePlanResume = () => {
+    const control = planExecutionControlRef.current;
+    if (!control || control.cancelled) return;
+    control.paused = false;
+    setPlanExecution((current) =>
+      current ? { ...current, status: "running" } : current,
+    );
+    control.wake?.();
+    control.wake = null;
+  };
+  const handlePlanCancel = () => {
+    const control = planExecutionControlRef.current;
+    if (!control) return;
+    control.cancelled = true;
+    control.paused = false;
+    control.wake?.();
+    control.wake = null;
   };
 
   return (
@@ -1511,7 +2227,7 @@ export function CanvasOpsApp() {
             variant="secondary"
             size="sm"
             onClick={() => undoLastChange()}
-            disabled={history.length === 0}
+            disabled={history.length === 0 || planExecution !== null}
           >
             <RotateCcw className="size-3.5" />
             Undo
@@ -1521,7 +2237,7 @@ export function CanvasOpsApp() {
             size="sm"
             className="hidden sm:inline-flex"
             onClick={() => redoLastChange()}
-            disabled={redoEntries.length === 0}
+            disabled={redoEntries.length === 0 || planExecution !== null}
           >
             <History className="size-3.5" />
             Replay
@@ -1531,9 +2247,32 @@ export function CanvasOpsApp() {
             size="sm"
             className="hidden sm:inline-flex"
             onClick={() => runAutoLayout({ direction: "LR", group_by: "layer" })}
+            disabled={planExecution !== null}
           >
             <LayoutDashboard className="size-3.5" />
             Arrange
+          </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="hidden lg:inline-flex"
+            onClick={resetDemo}
+            disabled={planExecution !== null}
+          >
+            <RotateCcw className="size-3.5" />
+            Demo Reset
+          </Button>
+          <Button
+            variant={judgeMode ? "primary" : "secondary"}
+            size="sm"
+            onClick={() => {
+              setJudgeMode((active) => !active);
+              setRightPanel("agent");
+            }}
+            disabled={planExecution !== null}
+          >
+            <MonitorPlay className="size-3.5" />
+            Judge Mode
           </Button>
           <Button
             size="sm"
@@ -1543,6 +2282,7 @@ export function CanvasOpsApp() {
                 architecture_hash: liveHash,
               })
             }
+            disabled={planExecution !== null}
           >
             <Zap className="size-3.5 fill-current" />
             Deploy
@@ -1565,6 +2305,7 @@ export function CanvasOpsApp() {
                   key={type}
                   className="palette-item"
                   draggable
+                  disabled={planExecution !== null}
                   onDragStart={(event) => {
                     event.dataTransfer.setData("application/canvasops-node", type);
                     event.dataTransfer.effectAllowed = "move";
@@ -1636,21 +2377,65 @@ export function CanvasOpsApp() {
 
           {activeOutage ? (
             <div className="outage-banner">
-              <AlertTriangle className="size-3.5" />
-              {activeOutage} outage active
-              <button
-                onClick={() =>
-                  simulateOutage({ region: activeOutage, mode: "recover" })
-                }
-              >
-                Recover region
-              </button>
+              <div className="outage-banner-title">
+                <span>
+                  <AlertTriangle className="size-3.5" />
+                  {activeOutage.toUpperCase()} regional outage
+                </span>
+                <strong>FAILOVER ACTIVE</strong>
+              </div>
+              <div className="outage-metrics">
+                <span>
+                  <strong>{outageImpact?.affectedCount ?? 0}</strong>
+                  resources offline
+                </span>
+                <span>
+                  <strong>{outageImpact?.failedPathCount ?? 0}</strong>
+                  paths interrupted
+                </span>
+                <span className="surviving">
+                  <strong>{outageImpact?.failoverCount ?? 0}</strong>
+                  APIs serving from {outageImpact?.failoverRegions.join(", ") || "backup"}
+                </span>
+              </div>
+              <div className="outage-routing">
+                <span className="route-pulse" />
+                Traffic is automatically rerouting across surviving paths
+                <button
+                  onClick={() =>
+                    simulateOutage({ region: activeOutage, mode: "recover" })
+                  }
+                >
+                  Recover region
+                </button>
+              </div>
             </div>
           ) : null}
 
+          {judgeMode ? (
+            <div className="judge-canvas-badge">
+              <MonitorPlay className="size-3.5" />
+              Judge Mode
+              <span>
+                {judgeStep + 1}/{judgeSteps.length}
+              </span>
+            </div>
+          ) : null}
+
+          {planExecution ? (
+            <PlanExecutionPanel
+              execution={planExecution}
+              liveCost={monthlyTotal}
+              liveResilience={liveValidation.resilienceScore}
+              onPause={handlePlanPause}
+              onResume={handlePlanResume}
+              onCancel={handlePlanCancel}
+            />
+          ) : null}
+
           <ReactFlow
-            nodes={nodes}
-            edges={edges}
+            nodes={displayNodes}
+            edges={displayEdges}
             nodeTypes={nodeTypes}
             onInit={setFlow}
             onNodesChange={handleNodesChange}
@@ -1677,6 +2462,9 @@ export function CanvasOpsApp() {
               dragStartRef.current = null;
             }}
             onPaneClick={() => setSelectedNodeId(null)}
+            nodesDraggable={planExecution === null}
+            nodesConnectable={planExecution === null}
+            elementsSelectable={planExecution === null}
             fitView
             fitViewOptions={{ padding: 0.23 }}
             minZoom={0.35}
@@ -1828,31 +2616,42 @@ export function CanvasOpsApp() {
                 )}
               </div>
 
-              <div className="browser-prompt-panel">
-                <div className="browser-prompt-heading">
-                  <span>
-                    <Sparkles className="size-3" />
-                    Demo prompts
-                  </span>
-                  <small>Click to copy</small>
+              {judgeMode ? (
+                <JudgeModePanel
+                  steps={judgeSteps}
+                  activeStep={judgeStep}
+                  copiedPrompt={copiedPrompt}
+                  onChangeStep={setJudgeStep}
+                  onCopyPrompt={(prompt) => void copyPrompt(prompt)}
+                  onClose={() => setJudgeMode(false)}
+                />
+              ) : (
+                <div className="browser-prompt-panel">
+                  <div className="browser-prompt-heading">
+                    <span>
+                      <Sparkles className="size-3" />
+                      Demo prompts
+                    </span>
+                    <small>Click to copy</small>
+                  </div>
+                  <div className="browser-prompts">
+                    {browserPrompts.map((prompt) => (
+                      <button
+                        key={prompt}
+                        onClick={() => void copyPrompt(prompt)}
+                        title={prompt}
+                      >
+                        <span>{prompt}</span>
+                        {copiedPrompt === prompt ? (
+                          <Check className="size-3.5 text-lime-300" />
+                        ) : (
+                          <Copy className="size-3.5" />
+                        )}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <div className="browser-prompts">
-                  {browserPrompts.map((prompt) => (
-                    <button
-                      key={prompt}
-                      onClick={() => void copyPrompt(prompt)}
-                      title={prompt}
-                    >
-                      <span>{prompt}</span>
-                      {copiedPrompt === prompt ? (
-                        <Check className="size-3.5 text-lime-300" />
-                      ) : (
-                        <Copy className="size-3.5" />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
+              )}
 
               <div className="tool-registry">
                 <div>

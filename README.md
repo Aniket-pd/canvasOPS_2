@@ -30,6 +30,22 @@ status, and timestamp. Every graph mutation is snapshot-backed and undoable.
 The graph is versioned in local storage, and the live resilience score updates
 immediately as humans or agents change the canvas.
 
+## Judge demo experience
+
+- **Demo Reset** restores the deterministic starter graph, clears the activity
+  feed, fits the canvas, and opens Judge Mode. The prior graph is still recoverable
+  with Undo.
+- **Judge Mode** guides a reviewer through live analysis, a human-approved
+  architecture plan, and regional failover with copy-ready prompts and expected
+  outcomes.
+- **Change visualization** animates added, updated, removed, connected, and
+  disconnected graph elements without persisting presentation state into the graph.
+- **Stepwise execution** plays every approved operation on the live canvas with
+  pause, resume, and cancel-and-rollback controls. The completed plan is stored as
+  one atomic Undo action; intermediate frames are never autosaved.
+- **Enhanced outage visualization** dims failed resources, marks interrupted paths,
+  pulses surviving failover routes, and reports the live impact and recovery target.
+
 ## Safety model
 
 - Read-only analysis and validation tools are annotated with `readOnlyHint`.
