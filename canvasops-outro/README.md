@@ -1,8 +1,9 @@
 # CanvasOps outro
 
-A 3.8-second, 1920×1080 Remotion outro built from the CanvasOps product design system.
+A 5.5-second, 1920×1080 Remotion outro built from the CanvasOps product design system.
 
-The CanvasOps layer mark resolves directly into the wordmark and product descriptor.
+The animation starts with a compact infrastructure graph, collapses it into the
+CanvasOps layer mark, and resolves to the product descriptor and core workflow.
 
 ## Preview
 
