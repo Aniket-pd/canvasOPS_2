@@ -822,6 +822,7 @@ export function CanvasOpsApp() {
   const visualChangeTimerRef = useRef<number | null>(null);
   const paymentResolverRef = useRef<((approved: boolean) => void) | null>(null);
   const proposalResolverRef = useRef<((approved: boolean) => void) | null>(null);
+  const replicaMenuRef = useRef<HTMLDetailsElement | null>(null);
 
   const applyGraph = useCallback(
     (nextNodes: InfrastructureNode[], nextEdges: Edge[]) => {
@@ -3150,7 +3151,7 @@ export function CanvasOpsApp() {
           <span className="font-mono text-zinc-600">{liveHash}</span>
           <ChevronDown className="size-3" />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="topbar-actions flex items-center gap-2">
           <Button
             variant="secondary"
             size="sm"
@@ -3745,26 +3746,64 @@ export function CanvasOpsApp() {
                   </label>
                 ) : null}
 
-                <label className="config-field">
+                <div className="config-field">
                   <span>Minimum replicas</span>
-                  <select
-                    value={policy.minimumReplicas}
-                    onChange={(event) =>
-                      setPolicy((current) => ({
-                        ...current,
-                        minimumReplicas: Number(event.target.value),
-                      }))
-                    }
+                  <details
+                    className="policy-select"
+                    ref={replicaMenuRef}
+                    onBlur={(event) => {
+                      if (!event.currentTarget.contains(event.relatedTarget)) {
+                        event.currentTarget.removeAttribute("open");
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        replicaMenuRef.current?.removeAttribute("open");
+                        replicaMenuRef.current
+                          ?.querySelector("summary")
+                          ?.focus();
+                      }
+                    }}
                   >
-                    {Array.from({ length: 12 }, (_, index) => index + 1).map(
-                      (replicas) => (
-                        <option key={replicas} value={replicas}>
-                          {replicas} replica{replicas === 1 ? "" : "s"}
-                        </option>
-                      ),
-                    )}
-                  </select>
-                </label>
+                    <summary>
+                      <span>
+                        {policy.minimumReplicas} replica
+                        {policy.minimumReplicas === 1 ? "" : "s"}
+                      </span>
+                      <ChevronDown className="size-4" />
+                    </summary>
+                    <div
+                      className="policy-select-menu"
+                      role="listbox"
+                      aria-label="Minimum replicas"
+                    >
+                      {Array.from({ length: 12 }, (_, index) => index + 1).map(
+                        (replicas) => (
+                          <button
+                            key={replicas}
+                            type="button"
+                            role="option"
+                            aria-selected={policy.minimumReplicas === replicas}
+                            onClick={() => {
+                              setPolicy((current) => ({
+                                ...current,
+                                minimumReplicas: replicas,
+                              }));
+                              replicaMenuRef.current?.removeAttribute("open");
+                            }}
+                          >
+                            <span>
+                              {replicas} replica{replicas === 1 ? "" : "s"}
+                            </span>
+                            {policy.minimumReplicas === replicas ? (
+                              <Check className="size-3.5" />
+                            ) : null}
+                          </button>
+                        ),
+                      )}
+                    </div>
+                  </details>
+                </div>
 
                 <fieldset className="policy-regions">
                   <legend>Required regions</legend>
