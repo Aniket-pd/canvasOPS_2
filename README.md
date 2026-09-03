@@ -6,8 +6,9 @@ same React Flow state through WebMCP tools.
 
 ## WebMCP tools
 
-- `analyze_current_architecture()` — graph, configuration, cost, resilience, and fingerprint
-- `validate_architecture(constraints)` — deterministic budget, region, replica, and connectivity policy checks
+- `analyze_current_architecture()` — graph, configuration, cost, active-policy resilience, and fingerprint
+- `get_active_policy()` — exact user-selected constraints, preset, and always-on checks
+- `validate_architecture(constraints)` — deterministic policy checks with the applied policy returned for auditability
 - `propose_architecture_plan(operations)` — costed multi-step preview with human approval and atomic apply
 - `add_infrastructure_node(type, x, y, config)` — deterministic node placement
 - `move_node(node_id, x, y)` / `remove_node(node_id)` — complete spatial and lifecycle editing
@@ -29,6 +30,11 @@ browser-agent tool calls with their exact arguments, result summaries, approval
 status, and timestamp. Every graph mutation is snapshot-backed and undoable.
 The graph is versioned in local storage, and the live resilience score updates
 immediately as humans or agents change the canvas.
+
+The right-side **Policy** tab lets users switch between economical, balanced,
+and resilient presets or customize the monthly budget, required regions, and
+minimum replica count. Policy changes are saved locally, revalidate the graph
+immediately, and become the defaults for agent validation and proposed plans.
 
 ## Judge demo experience
 

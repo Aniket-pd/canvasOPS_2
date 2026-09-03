@@ -108,6 +108,79 @@ import { simulateX402Settlement } from "@/lib/x402-mock";
 
 const nodeTypes = { infrastructure: InfrastructureNodeCard };
 const STORAGE_KEY = "canvasops.graph.v2";
+const POLICY_STORAGE_KEY = "canvasops.policy.v1";
+
+type EditablePolicy = {
+  maxMonthlyCost?: number;
+  requiredRegions: string[];
+  minimumReplicas: number;
+};
+
+const regionOptions = [
+  { value: "bom-1", label: "Mumbai" },
+  { value: "sin-1", label: "Singapore" },
+  { value: "fra-1", label: "Frankfurt" },
+  { value: "iad-1", label: "Virginia" },
+] as const;
+
+const policyPresets = {
+  economical: {
+    label: "Economical",
+    policy: {
+      maxMonthlyCost: 180,
+      requiredRegions: ["bom-1"],
+      minimumReplicas: 1,
+    },
+  },
+  balanced: {
+    label: "Balanced",
+    policy: {
+      maxMonthlyCost: 300,
+      requiredRegions: ["bom-1", "sin-1"],
+      minimumReplicas: 2,
+    },
+  },
+  resilient: {
+    label: "Resilient",
+    policy: {
+      maxMonthlyCost: 600,
+      requiredRegions: ["bom-1", "sin-1", "fra-1"],
+      minimumReplicas: 3,
+    },
+  },
+} satisfies Record<string, { label: string; policy: EditablePolicy }>;
+
+const defaultPolicy: EditablePolicy = policyPresets.balanced.policy;
+
+function samePolicy(left: EditablePolicy, right: EditablePolicy) {
+  return (
+    left.maxMonthlyCost === right.maxMonthlyCost &&
+    left.minimumReplicas === right.minimumReplicas &&
+    [...left.requiredRegions].sort().join(",") ===
+      [...right.requiredRegions].sort().join(",")
+  );
+}
+
+function policyPresetName(policy: EditablePolicy) {
+  return (
+    Object.entries(policyPresets).find(([, preset]) =>
+      samePolicy(policy, preset.policy),
+    )?.[0] ?? "custom"
+  );
+}
+
+function appliedPolicyPayload(
+  policy: EditablePolicy,
+  source: "active_policy" | "active_policy_with_overrides" = "active_policy",
+) {
+  return {
+    source,
+    preset: policyPresetName(policy),
+    max_monthly_cost_usdc: policy.maxMonthlyCost ?? null,
+    required_regions: [...policy.requiredRegions],
+    minimum_replicas: policy.minimumReplicas,
+  };
+}
 
 const configSchema = z
   .object({
@@ -131,6 +204,7 @@ const configSchema = z
 const analyzeArchitectureSchema = z.object({}).strict();
 const getComponentCatalogSchema = z.object({}).strict();
 const getSelectionContextSchema = z.object({}).strict();
+const getActivePolicySchema = z.object({}).strict();
 const addInfrastructureNodeSchema = z
   .object({
     type: z.enum(infrastructureTypes),
@@ -423,20 +497,29 @@ const paletteIcons: Record<
   note: StickyNote,
 };
 
-const judgeSteps: JudgeStep[] = [
+function judgeStepsForPolicy(policy: EditablePolicy): JudgeStep[] {
+  const regions = policy.requiredRegions
+    .map(
+      (region) =>
+        regionOptions.find((option) => option.value === region)?.label ?? region,
+    )
+    .join(" and ");
+  const budget = policy.maxMonthlyCost
+    ? ` and a $${policy.maxMonthlyCost} monthly budget`
+    : "";
+
+  return [
   {
     title: "Inspect the live graph",
     goal: "Prove that the agent can read the same architecture the human sees.",
-    prompt:
-      "Validate this architecture for Mumbai and Singapore, with at least 2 replicas and a $300 monthly budget.",
+    prompt: `Validate this architecture${regions ? ` for ${regions}` : ""}, with at least ${policy.minimumReplicas} replica${policy.minimumReplicas === 1 ? "" : "s"}${budget}.`,
     expected:
       "A deterministic resilience score, exact cost, regional coverage, and actionable findings in the activity log.",
   },
   {
     title: "Collaborate on a safe change",
     goal: "Show an agent planning real canvas mutations while the human stays in control.",
-    prompt:
-      "Propose a safe plan to make this architecture highly available under $300. Ask me to approve before applying it.",
+    prompt: `Propose a safe plan that satisfies the active policy${policy.maxMonthlyCost ? ` under $${policy.maxMonthlyCost}` : ""}. Ask me to approve before applying it.`,
     expected:
       "A costed before/after proposal, explicit approval, animated graph changes, and one-step undo.",
   },
@@ -448,12 +531,12 @@ const judgeSteps: JudgeStep[] = [
     expected:
       "Failed resources turn red, unavailable paths stop, surviving routes pulse, and recovery restores the graph.",
   },
-];
-
-const browserPrompts = judgeSteps.map((step) => step.prompt);
+  ];
+}
 
 const registeredToolNames = [
   "analyze_current_architecture",
+  "get_active_policy",
   "get_component_catalog",
   "get_selection_context",
   "validate_architecture",
@@ -696,7 +779,10 @@ export function CanvasOpsApp() {
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([]);
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
-  const [rightPanel, setRightPanel] = useState<"agent" | "config">("agent");
+  const [rightPanel, setRightPanel] = useState<"agent" | "config" | "policy">(
+    "agent",
+  );
+  const [policy, setPolicy] = useState<EditablePolicy>(defaultPolicy);
   const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
   const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null);
   const [history, setHistory] = useState<GraphHistoryEntry[]>([]);
@@ -727,6 +813,7 @@ export function CanvasOpsApp() {
   const historyIdRef = useRef(1);
   const toolEventIdRef = useRef(1);
   const hydratedRef = useRef(false);
+  const policyHydratedRef = useRef(false);
   const skipInitialSaveRef = useRef(true);
   const suspendAutosaveRef = useRef(false);
   const graphMutationLockedRef = useRef(false);
@@ -898,6 +985,44 @@ export function CanvasOpsApp() {
       hydratedRef.current = true;
     }
   }, [applyGraph]);
+
+  useEffect(() => {
+    let nextPolicy: EditablePolicy | null = null;
+    try {
+      const saved = window.localStorage.getItem(POLICY_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as Partial<EditablePolicy>;
+        nextPolicy = {
+          maxMonthlyCost:
+            typeof parsed.maxMonthlyCost === "number" &&
+            parsed.maxMonthlyCost > 0
+              ? Math.min(parsed.maxMonthlyCost, 100_000)
+              : undefined,
+          requiredRegions: Array.isArray(parsed.requiredRegions)
+            ? parsed.requiredRegions.filter((region): region is string =>
+                regionOptions.some((option) => option.value === region),
+              )
+            : defaultPolicy.requiredRegions,
+          minimumReplicas:
+            typeof parsed.minimumReplicas === "number"
+              ? Math.min(12, Math.max(1, Math.round(parsed.minimumReplicas)))
+              : defaultPolicy.minimumReplicas,
+        };
+      }
+    } catch {
+      window.localStorage.removeItem(POLICY_STORAGE_KEY);
+    }
+    const hydratePolicy = window.setTimeout(() => {
+      if (nextPolicy) setPolicy(nextPolicy);
+      policyHydratedRef.current = true;
+    }, 0);
+    return () => window.clearTimeout(hydratePolicy);
+  }, []);
+
+  useEffect(() => {
+    if (!policyHydratedRef.current) return;
+    window.localStorage.setItem(POLICY_STORAGE_KEY, JSON.stringify(policy));
+  }, [policy]);
 
   useEffect(() => {
     if (!hydratedRef.current) return;
@@ -1284,14 +1409,25 @@ export function CanvasOpsApp() {
     const validation = validateArchitecture(
       nodesRef.current,
       edgesRef.current,
+      policy,
     );
     return {
       node_count: nodesRef.current.length,
       edge_count: edgesRef.current.length,
       estimated_monthly_cost_usdc: validation.estimatedMonthlyCostUsdc,
       architecture_hash: architectureHash(nodesRef.current, edgesRef.current),
+      policy_status: validation.status,
       resilience_score: validation.resilienceScore,
+      budget_headroom_usdc: validation.budgetHeadroomUsdc,
       disconnected_node_ids: validation.disconnectedNodeIds,
+      applied_policy: appliedPolicyPayload(policy),
+      policy_findings: validation.findings.map((finding) => ({
+        id: finding.id,
+        severity: finding.severity,
+        title: finding.title,
+        detail: finding.detail,
+        node_ids: finding.nodeIds,
+      })),
       nodes: nodesRef.current.map((node) => ({
         id: node.id,
         reference: nodeReference(node.id),
@@ -1316,7 +1452,7 @@ export function CanvasOpsApp() {
         edge_id: selectedEdgeIdRef.current,
       },
     };
-  }, []);
+  }, [policy]);
 
   const getSelectionContext = useCallback(() => {
     const selectedIds = new Set(selectedNodeIdsRef.current);
@@ -1421,6 +1557,10 @@ export function CanvasOpsApp() {
     setSelectedNodeId(null);
     setSelectedNodeIds([]);
     setSelectedEdgeId(null);
+    setPolicy({
+      ...defaultPolicy,
+      requiredRegions: [...defaultPolicy.requiredRegions],
+    });
     setRightPanel("agent");
     setJudgeMode(true);
     setJudgeStep(0);
@@ -2040,7 +2180,7 @@ export function CanvasOpsApp() {
     {
       name: "analyze_current_architecture",
       description:
-        "Read the complete live graph, positions, configuration, connections, cost, resilience score, and architecture fingerprint. Call before modifying an unfamiliar architecture.",
+        "Read the complete live graph, positions, configuration, connections, cost, active-policy findings, resilience score, and architecture fingerprint. Call before modifying an unfamiliar architecture.",
       inputSchema: analyzeArchitectureSchema,
       annotations: { readOnlyHint: true },
       execute: (input) => {
@@ -2055,6 +2195,35 @@ export function CanvasOpsApp() {
       },
     },
     [analyzeArchitecture, logToolEvent],
+  );
+
+  useWebMCP(
+    {
+      name: "get_active_policy",
+      description:
+        "Read the exact user-selected architecture policy, including its preset, monthly budget, required regions, minimum replicas, and always-on safety checks. Call before validating or proposing policy-sensitive changes.",
+      inputSchema: getActivePolicySchema,
+      annotations: { readOnlyHint: true },
+      execute: (input) => {
+        const parsed = getActivePolicySchema.parse(input);
+        const result = {
+          ...appliedPolicyPayload(policy),
+          always_on_checks: [
+            "disconnected_resources",
+            "invalid_dependencies",
+            "single_points_of_failure",
+            "global_entry_point",
+          ],
+        };
+        logToolEvent(
+          "get_active_policy",
+          `Read ${result.preset} policy: ${result.minimum_replicas} replica minimum${result.max_monthly_cost_usdc === null ? " with no budget limit" : ` under $${result.max_monthly_cost_usdc}/month`}.`,
+          parsed,
+        );
+        return result;
+      },
+    },
+    [logToolEvent, policy],
   );
 
   useWebMCP(
@@ -2115,11 +2284,20 @@ export function CanvasOpsApp() {
       annotations: { readOnlyHint: true },
       execute: (input) => {
         const parsed = validateArchitectureSchema.parse(input);
-        const result = validateArchitecture(nodesRef.current, edgesRef.current, {
-          maxMonthlyCost: parsed.max_monthly_cost_usdc,
-          requiredRegions: parsed.required_regions,
-          minimumReplicas: parsed.minimum_replicas,
-        });
+        const appliedPolicy: EditablePolicy = {
+          maxMonthlyCost:
+            parsed.max_monthly_cost_usdc ?? policy.maxMonthlyCost,
+          requiredRegions: parsed.required_regions ?? policy.requiredRegions,
+          minimumReplicas: parsed.minimum_replicas ?? policy.minimumReplicas,
+        };
+        const hasOverrides = Object.values(parsed).some(
+          (value) => value !== undefined,
+        );
+        const result = validateArchitecture(
+          nodesRef.current,
+          edgesRef.current,
+          appliedPolicy,
+        );
         logToolEvent(
           "validate_architecture",
           `${result.status.toUpperCase()}: resilience ${result.resilienceScore}/100 with ${result.findings.length} finding(s).`,
@@ -2130,6 +2308,10 @@ export function CanvasOpsApp() {
           resilience_score: result.resilienceScore,
           estimated_monthly_cost_usdc: result.estimatedMonthlyCostUsdc,
           budget_headroom_usdc: result.budgetHeadroomUsdc,
+          applied_policy: appliedPolicyPayload(
+            appliedPolicy,
+            hasOverrides ? "active_policy_with_overrides" : "active_policy",
+          ),
           disconnected_node_ids: result.disconnectedNodeIds,
           regions: result.regions,
           findings: result.findings.map((finding) => ({
@@ -2142,7 +2324,7 @@ export function CanvasOpsApp() {
         };
       },
     },
-    [logToolEvent],
+    [logToolEvent, policy],
   );
 
   useWebMCP(
@@ -2430,10 +2612,16 @@ export function CanvasOpsApp() {
         "Preview a strict multi-operation architecture plan with a cost diff. The human must approve the in-page proposal before changes apply atomically.",
       inputSchema: proposeArchitecturePlanSchema,
       annotations: { readOnlyHint: false },
-      execute: (input) =>
-        proposeArchitecturePlan(proposeArchitecturePlanSchema.parse(input)),
+      execute: (input) => {
+        const parsed = proposeArchitecturePlanSchema.parse(input);
+        return proposeArchitecturePlan({
+          ...parsed,
+          max_monthly_cost_usdc:
+            parsed.max_monthly_cost_usdc ?? policy.maxMonthlyCost,
+        });
+      },
     },
-    [proposeArchitecturePlan],
+    [policy.maxMonthlyCost, proposeArchitecturePlan],
   );
 
   useEffect(() => {
@@ -2491,12 +2679,17 @@ export function CanvasOpsApp() {
   const liveHash = useMemo(() => architectureHash(nodes, edges), [edges, nodes]);
   const liveValidation = useMemo(
     () =>
-      validateArchitecture(nodes, edges, {
-        maxMonthlyCost: 300,
-        requiredRegions: ["bom-1", "sin-1"],
-        minimumReplicas: 2,
-      }),
-    [edges, nodes],
+      validateArchitecture(nodes, edges, policy),
+    [edges, nodes, policy],
+  );
+  const activePolicyPreset = useMemo(
+    () => policyPresetName(policy),
+    [policy],
+  );
+  const activeJudgeSteps = useMemo(() => judgeStepsForPolicy(policy), [policy]);
+  const browserPrompts = useMemo(
+    () => activeJudgeSteps.map((step) => step.prompt),
+    [activeJudgeSteps],
   );
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId) ?? null,
@@ -3169,7 +3362,7 @@ export function CanvasOpsApp() {
               <MonitorPlay className="size-3.5" />
               Judge Mode
               <span>
-                {judgeStep + 1}/{judgeSteps.length}
+                {judgeStep + 1}/{activeJudgeSteps.length}
               </span>
             </div>
           ) : null}
@@ -3285,6 +3478,13 @@ export function CanvasOpsApp() {
             >
               <Activity className="size-3.5" />
               WebMCP Activity
+            </button>
+            <button
+              className={rightPanel === "policy" ? "active" : ""}
+              onClick={() => setRightPanel("policy")}
+            >
+              <ShieldCheck className="size-3.5" />
+              Policy
             </button>
             <button
               className={rightPanel === "config" ? "active" : ""}
@@ -3404,7 +3604,7 @@ export function CanvasOpsApp() {
 
               {judgeMode ? (
                 <JudgeModePanel
-                  steps={judgeSteps}
+                  steps={activeJudgeSteps}
                   activeStep={judgeStep}
                   copiedPrompt={copiedPrompt}
                   onChangeStep={setJudgeStep}
@@ -3454,6 +3654,194 @@ export function CanvasOpsApp() {
                 </div>
               </div>
             </>
+          ) : rightPanel === "policy" ? (
+            <div className="policy-panel">
+              <div className="policy-heading">
+                <div>
+                  <span className="policy-eyebrow">Live guardrails</span>
+                  <h2>Architecture policy</h2>
+                  <p>Changes apply instantly and are saved on this device.</p>
+                </div>
+                <span className={`policy-status ${liveValidation.status}`}>
+                  {liveValidation.status}
+                </span>
+              </div>
+
+              <section className="policy-section">
+                <div className="policy-section-title">
+                  <span>Preset</span>
+                  <small>{activePolicyPreset}</small>
+                </div>
+                <div className="policy-presets">
+                  {Object.entries(policyPresets).map(([key, preset]) => (
+                    <button
+                      key={key}
+                      className={activePolicyPreset === key ? "active" : ""}
+                      onClick={() =>
+                        setPolicy({
+                          ...preset.policy,
+                          requiredRegions: [...preset.policy.requiredRegions],
+                        })
+                      }
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section className="policy-section policy-fields">
+                <div className="policy-toggle-row">
+                  <div>
+                    <strong>Monthly budget</strong>
+                    <span>Block plans that exceed the limit</span>
+                  </div>
+                  <label className="policy-switch">
+                    <input
+                      type="checkbox"
+                      checked={policy.maxMonthlyCost !== undefined}
+                      onChange={(event) =>
+                        setPolicy((current) => ({
+                          ...current,
+                          maxMonthlyCost: event.target.checked
+                            ? current.maxMonthlyCost ?? 300
+                            : undefined,
+                        }))
+                      }
+                    />
+                    <span />
+                  </label>
+                </div>
+
+                {policy.maxMonthlyCost !== undefined ? (
+                  <label className="config-field">
+                    <span>Maximum monthly cost (USDC)</span>
+                    <div className="policy-money-input">
+                      <span>$</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100000}
+                        value={policy.maxMonthlyCost}
+                        onChange={(event) => {
+                          const nextValue = Number(event.target.value);
+                          if (!Number.isFinite(nextValue)) return;
+                          setPolicy((current) => ({
+                            ...current,
+                            maxMonthlyCost: Math.min(
+                              100_000,
+                              Math.max(1, nextValue),
+                            ),
+                          }));
+                        }}
+                      />
+                    </div>
+                    <small className="policy-field-note">
+                      {liveValidation.budgetHeadroomUsdc !== null &&
+                      liveValidation.budgetHeadroomUsdc >= 0
+                        ? `$${liveValidation.budgetHeadroomUsdc} headroom remaining`
+                        : `$${Math.abs(liveValidation.budgetHeadroomUsdc ?? 0)} over budget`}
+                    </small>
+                  </label>
+                ) : null}
+
+                <label className="config-field">
+                  <span>Minimum replicas</span>
+                  <select
+                    value={policy.minimumReplicas}
+                    onChange={(event) =>
+                      setPolicy((current) => ({
+                        ...current,
+                        minimumReplicas: Number(event.target.value),
+                      }))
+                    }
+                  >
+                    {Array.from({ length: 12 }, (_, index) => index + 1).map(
+                      (replicas) => (
+                        <option key={replicas} value={replicas}>
+                          {replicas} replica{replicas === 1 ? "" : "s"}
+                        </option>
+                      ),
+                    )}
+                  </select>
+                </label>
+
+                <fieldset className="policy-regions">
+                  <legend>Required regions</legend>
+                  <div>
+                    {regionOptions.map((region) => (
+                      <label key={region.value}>
+                        <input
+                          type="checkbox"
+                          checked={policy.requiredRegions.includes(region.value)}
+                          onChange={(event) =>
+                            setPolicy((current) => ({
+                              ...current,
+                              requiredRegions: event.target.checked
+                                ? [...current.requiredRegions, region.value]
+                                : current.requiredRegions.filter(
+                                    (value) => value !== region.value,
+                                  ),
+                            }))
+                          }
+                        />
+                        <span>
+                          <strong>{region.label}</strong>
+                          <small>{region.value}</small>
+                        </span>
+                        <Check className="size-3.5" />
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+              </section>
+
+              <section className="policy-result">
+                <div>
+                  <span>
+                    <ShieldCheck className="size-3.5" />
+                    Live result
+                  </span>
+                  <strong>{liveValidation.resilienceScore}/100</strong>
+                </div>
+                <p>
+                  {liveValidation.findings.length === 0
+                    ? "This architecture satisfies the active policy."
+                    : `${liveValidation.findings.length} finding${liveValidation.findings.length === 1 ? "" : "s"} need attention.`}
+                </p>
+                {liveValidation.findings.slice(0, 4).map((finding) => (
+                  <div className="policy-finding" key={finding.id}>
+                    <span data-severity={finding.severity} />
+                    <div>
+                      <strong>{finding.title}</strong>
+                      <small>{finding.detail}</small>
+                    </div>
+                  </div>
+                ))}
+              </section>
+
+              <section className="policy-fixed-rules">
+                <strong>Always-on safety checks</strong>
+                <p>
+                  Invalid connections, disconnected resources, global routing,
+                  and single points of failure remain enforced.
+                </p>
+              </section>
+
+              <Button
+                variant="secondary"
+                className="w-full"
+                onClick={() =>
+                  setPolicy({
+                    ...defaultPolicy,
+                    requiredRegions: [...defaultPolicy.requiredRegions],
+                  })
+                }
+              >
+                <RotateCcw className="size-3.5" />
+                Restore balanced defaults
+              </Button>
+            </div>
           ) : selectedNode ? (
             <div className="config-panel">
               <div className="config-title">
